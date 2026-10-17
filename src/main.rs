@@ -1,14 +1,16 @@
 mod generations;
 mod http;
+mod replica;
 mod sync;
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
@@ -16,7 +18,11 @@ use tracing_subscriber::EnvFilter;
 use turso_core::{DatabaseOpts, OpenFlags};
 
 use crate::http::AppState;
-use crate::sync::{CheckpointConfig, OpenConfig, TursoSyncServer};
+use crate::replica::Target;
+use crate::sync::{BackupConfig, CheckpointConfig, OpenConfig, TursoSyncServer};
+
+/// Covers the upload of the WAL tail written since the last backup tick.
+const SHUTDOWN_BACKUP_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -101,6 +107,34 @@ struct Opts {
     /// Checkpoint after every write request (for testing).
     #[arg(long, hide = true)]
     checkpoint_after_write: bool,
+    #[arg(
+        long,
+        global = true,
+        env = "TURSO_SYNC_BACKUP_URL",
+        help = "Back up to s3://bucket/prefix (configured through AWS_* variables) or to a directory"
+    )]
+    backup_url: Option<String>,
+    #[arg(
+        long,
+        env = "TURSO_SYNC_BACKUP_INTERVAL",
+        default_value_t = 1,
+        help = "Seconds between uploads of new WAL frames"
+    )]
+    backup_interval: u64,
+    #[arg(
+        long,
+        env = "TURSO_SYNC_BACKUP_SNAPSHOT_INTERVAL",
+        default_value_t = 86400,
+        help = "Seconds between full snapshots (0 takes one at every checkpoint)"
+    )]
+    backup_snapshot_interval: u64,
+    #[arg(
+        long,
+        env = "TURSO_SYNC_BACKUP_RETENTION_DAYS",
+        default_value_t = 0,
+        help = "Days of backup history to keep (0 keeps everything)"
+    )]
+    backup_retention_days: u64,
     #[arg(long, env = "TURSO_SYNC_VFS")]
     vfs: Option<String>,
     #[arg(long)]
@@ -131,10 +165,50 @@ struct Opts {
 enum Command {
     /// Exit successfully if the server listening on --listen answers /health
     Healthcheck,
+    /// Restore a database from --backup-url
+    Restore {
+        /// Where to write the database
+        output: PathBuf,
+        /// Restore the state at this time (RFC 3339, e.g. 2026-10-17T12:00:00Z)
+        #[arg(long)]
+        at: Option<String>,
+        /// Replace an existing database, its WAL and sync state
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the backup generations stored at --backup-url
+    Backups,
 }
 
 impl Opts {
-    fn open_config(&self) -> OpenConfig {
+    fn backup_config(&self) -> Result<Option<BackupConfig>> {
+        let Some(url) = &self.backup_url else {
+            return Ok(None);
+        };
+        if self.readonly {
+            bail!("--backup-url needs a writable database");
+        }
+        if self.database.as_deref() == Some(":memory:") {
+            bail!("--backup-url needs a database file");
+        }
+        Ok(Some(BackupConfig {
+            target: Target::open(url)?,
+            interval: Duration::from_secs(self.backup_interval.max(1)),
+            snapshot_interval: Duration::from_secs(self.backup_snapshot_interval),
+            retention: (self.backup_retention_days > 0)
+                .then(|| Duration::from_secs(self.backup_retention_days * 24 * 3600)),
+        }))
+    }
+
+    fn backup_target(&self) -> Result<Arc<Target>> {
+        let url = self
+            .backup_url
+            .as_deref()
+            .ok_or_else(|| anyhow!("--backup-url is required"))?;
+        Target::open(url)
+    }
+
+    fn open_config(&self, backup: Option<BackupConfig>) -> OpenConfig {
         let mut flags = OpenFlags::default();
         flags.set(OpenFlags::ReadOnly, self.readonly);
         OpenConfig {
@@ -155,6 +229,7 @@ impl Opts {
                 ),
             max_open: self.sync_max_databases,
             keep_generations: self.keep_generations.max(1),
+            backup,
         }
     }
 
@@ -218,11 +293,18 @@ async fn main() -> Result<()> {
         .init();
 
     let opts = Opts::parse();
-    if let Some(Command::Healthcheck) = opts.command {
-        return healthcheck(&opts.listen);
+    match &opts.command {
+        Some(Command::Healthcheck) => return healthcheck(&opts.listen),
+        Some(Command::Restore { output, at, force }) => {
+            return restore(opts.backup_target()?.as_ref(), output, at.as_deref(), *force).await
+        }
+        Some(Command::Backups) => return list_backups(opts.backup_target()?.as_ref()).await,
+        None => {}
     }
     let auth_token = opts.auth_token()?;
-    let config = opts.open_config();
+    let backup = opts.backup_config()?;
+    let backups_enabled = backup.is_some();
+    let config = opts.open_config(backup);
     let checkpoint = opts.checkpoint_config();
 
     let server = match (&opts.sync_dir, &opts.database) {
@@ -232,6 +314,9 @@ async fn main() -> Result<()> {
         }
         (None, Some(path)) => {
             info!("serving database {path}");
+            if let Some(backup) = &config.backup {
+                replica::restore_missing(&backup.target, Path::new(path)).await?;
+            }
             TursoSyncServer::new(path, &config, checkpoint)?
         }
         (None, None) => return Err(anyhow!("a database path or --sync-dir is required")),
@@ -257,7 +342,7 @@ async fn main() -> Result<()> {
             }
         });
     }
-    let app = http::router(state, opts.max_request_bytes);
+    let app = http::router(state.clone(), opts.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(&opts.listen)
         .await
         .with_context(|| format!("failed to listen on {}", opts.listen))?;
@@ -266,7 +351,62 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    if backups_enabled {
+        info!("uploading the rest of the WAL to the backup");
+        let flush = tokio::task::spawn_blocking(move || state.server.flush_backups());
+        if tokio::time::timeout(SHUTDOWN_BACKUP_TIMEOUT, flush).await.is_err() {
+            warn!("gave up on the final backup upload");
+        }
+    }
     info!("stopped");
+    Ok(())
+}
+
+async fn restore(target: &Target, output: &Path, at: Option<&str>, force: bool) -> Result<()> {
+    if output.exists() && !force {
+        bail!("{} exists; pass --force to replace it", output.display());
+    }
+    let at = at
+        .map(|at| DateTime::parse_from_rfc3339(at).map(|time| time.with_timezone(&Utc)))
+        .transpose()
+        .context("--at expects an RFC 3339 time such as 2026-10-17T12:00:00Z")?;
+    let Some(restored) = replica::restore(target, output, at).await? else {
+        match at {
+            Some(at) => bail!("{target} holds no backup from before {at}"),
+            None => bail!("{target} holds no backup"),
+        }
+    };
+    let tip = restored.chain.last().expect("a restore replays at least one generation");
+    println!(
+        "restored {} to generation {tip}: {} generations, {} frames replayed",
+        output.display(),
+        restored.chain.len(),
+        restored.frames,
+    );
+    if !restored.complete {
+        println!("the backup has a gap, so later changes could not be restored");
+    }
+    Ok(())
+}
+
+async fn list_backups(target: &Target) -> Result<()> {
+    let format_time = |time: Option<DateTime<Utc>>| {
+        time.map_or("-".to_string(), |time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
+    };
+    println!("{:<34} {:<20} {:<20} {:>10}  BASE", "GENERATION", "STARTED", "LAST UPLOAD", "FRAMES");
+    for generation in replica::list(target).await? {
+        let base = match &generation.meta {
+            Some(meta) => meta.to_string(),
+            None => "incomplete".to_string(),
+        };
+        println!(
+            "{:<34} {:<20} {:<20} {:>10}  {base}",
+            generation.id,
+            format_time(replica::generation_time(&generation.id)),
+            format_time(generation.last_upload),
+            generation.last_frame,
+        );
+    }
     Ok(())
 }
 

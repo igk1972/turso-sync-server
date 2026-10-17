@@ -363,7 +363,7 @@ fn list_generations(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     Ok(sealed)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut file = File::create(&tmp)?;

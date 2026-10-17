@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -15,6 +15,7 @@ use turso_core::{
 };
 
 use crate::generations::{Generations, Revision, SealedPages};
+use crate::replica::{self, Job, Replica, Target};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
     ExecuteStreamReq, ExecuteStreamResp, MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto,
@@ -43,6 +44,9 @@ const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 /// checkpoint in between would make that revision unreadable. Pinned reads and
 /// page-selector reads therefore hold checkpoints off for this long.
 const PINNED_READ_LEASE: Duration = Duration::from_secs(60);
+/// How long a checkpoint waits for a backup upload running without the lock.
+const BACKUP_IDLE_WAIT: Duration = Duration::from_secs(30);
+const BACKUP_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 pub struct OpenConfig {
     pub vfs: Option<String>,
@@ -50,6 +54,7 @@ pub struct OpenConfig {
     pub db_opts: DatabaseOpts,
     pub max_open: usize,
     pub keep_generations: usize,
+    pub backup: Option<BackupConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,9 +64,39 @@ pub struct CheckpointConfig {
     pub after_write: bool,
 }
 
+#[derive(Clone)]
+pub struct BackupConfig {
+    pub target: Arc<Target>,
+    pub interval: Duration,
+    pub snapshot_interval: Duration,
+    pub retention: Option<Duration>,
+}
+
 pub(crate) struct DbHandle {
     state: Mutex<DbState>,
+    /// Signalled when a backup upload that ran without the lock finishes.
+    backup_idle: Condvar,
     path: String,
+}
+
+impl DbHandle {
+    /// Locks the database once no backup upload is in flight, so that a
+    /// checkpoint does not change the files under it.
+    fn lock_idle(&self) -> MutexGuard<'_, DbState> {
+        let state = self.state.lock().unwrap();
+        self.backup_idle
+            .wait_timeout_while(state, BACKUP_IDLE_WAIT, |state| {
+                state.replica.as_ref().is_some_and(Replica::busy)
+            })
+            .unwrap()
+            .0
+    }
+
+    fn finish_backup_job(&self, job: &Job, succeeded: bool) -> Result<bool> {
+        let result = self.state.lock().unwrap().finish_backup_job(job, succeeded);
+        self.backup_idle.notify_all();
+        result
+    }
 }
 
 struct DbState {
@@ -72,6 +107,7 @@ struct DbState {
     wal_salts_recorded: bool,
     pinned_until: Option<Instant>,
     last_checkpoint: Instant,
+    replica: Option<Replica>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,13 +127,30 @@ impl DbState {
         let Some(generations) = self.generations.as_mut() else {
             return Ok(CheckpointOutcome::Skipped);
         };
-        if self.pinned_until.is_some_and(|until| Instant::now() < until) {
+        if self.pinned_until.is_some_and(|until| Instant::now() < until)
+            || self.replica.as_ref().is_some_and(Replica::busy)
+        {
             return Ok(CheckpointOutcome::Deferred);
         }
         let wal = self.conn.wal_state()?;
         if wal.max_frame == 0 || wal.max_frame < min_frames {
             return Ok(CheckpointOutcome::Skipped);
         }
+        // The backup has to hold the whole WAL before the checkpoint drops it;
+        // otherwise the next backup generation has to start from a snapshot.
+        let backed_up = match self.replica.as_mut() {
+            Some(replica) => {
+                let (epoch, current) = (generations.epoch(), generations.current());
+                match replica.flush_blocking(&self.conn, epoch, current, false) {
+                    Ok(backed_up) => backed_up,
+                    Err(err) => {
+                        warn!("{path}: checkpoint postponed, the backup upload failed: {err:#}");
+                        return Ok(CheckpointOutcome::Deferred);
+                    }
+                }
+            }
+            None => false,
+        };
         let pages: RoaringBitmap = self.conn.wal_changed_pages_after(0)?.into_iter().collect();
         let page_count = pages.len();
         generations.seal(SealedPages::Known(pages))?;
@@ -112,6 +165,9 @@ impl DbState {
         generations.store_identity(after.checkpoint_seq_no, after.max_frame > 0)?;
         self.wal_salts_recorded = after.max_frame > 0;
         self.last_checkpoint = Instant::now();
+        if let Some(replica) = self.replica.as_mut() {
+            replica.on_checkpoint(generations.epoch(), generations.current(), backed_up)?;
+        }
         if let Err(err) = result {
             return Err(anyhow!("checkpoint failed, the WAL is kept: {err}"));
         }
@@ -150,6 +206,38 @@ impl DbState {
         }
         Ok(())
     }
+
+    fn backup_job(&mut self) -> Result<Option<Job>> {
+        let (Some(replica), Some(generations)) = (self.replica.as_mut(), self.generations.as_ref())
+        else {
+            return Ok(None);
+        };
+        let wal = self.conn.wal_state()?;
+        replica.next_job(&self.conn, generations.epoch(), generations.current(), &wal, true)
+    }
+
+    fn finish_backup_job(&mut self, job: &Job, succeeded: bool) -> Result<bool> {
+        let Some(replica) = self.replica.as_mut() else {
+            return Ok(false);
+        };
+        match self.conn.wal_state() {
+            Ok(wal) => replica.finish(job, succeeded, &wal),
+            Err(err) => {
+                replica.abandon();
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Uploads what the backup lacks, a snapshot included.
+    fn flush_backup(&mut self) -> Result<()> {
+        let (Some(replica), Some(generations)) = (self.replica.as_mut(), self.generations.as_ref())
+        else {
+            return Ok(());
+        };
+        replica.flush_blocking(&self.conn, generations.epoch(), generations.current(), true)?;
+        Ok(())
+    }
 }
 
 struct OpenHandles {
@@ -161,7 +249,7 @@ enum DbSource {
     Single(Arc<DbHandle>),
     Dir {
         base: PathBuf,
-        config: OpenConfig,
+        config: Box<OpenConfig>,
         open_handles: Mutex<OpenHandles>,
     },
 }
@@ -174,7 +262,11 @@ pub struct TursoSyncServer {
 impl TursoSyncServer {
     pub fn new(db_path: &str, config: &OpenConfig, checkpoint: CheckpointConfig) -> Result<Self> {
         Ok(Self {
-            source: DbSource::Single(open_db_handle(Path::new(db_path), config)?),
+            source: DbSource::Single(open_db_handle(
+                Path::new(db_path),
+                config,
+                config.backup.as_ref().map(|backup| backup.target.clone()),
+            )?),
             checkpoint,
         })
     }
@@ -194,7 +286,7 @@ impl TursoSyncServer {
         Ok(Self {
             source: DbSource::Dir {
                 base: base.canonicalize()?,
-                config,
+                config: Box::new(config),
                 open_handles,
             },
             checkpoint,
@@ -217,18 +309,27 @@ impl TursoSyncServer {
             return;
         };
         for handle in self.open_databases() {
-            let mut state = handle.state.lock().unwrap();
-            if state.last_checkpoint.elapsed() < interval {
+            if handle.state.lock().unwrap().last_checkpoint.elapsed() < interval {
                 continue;
             }
+            let mut state = handle.lock_idle();
             if let Err(err) = state.checkpoint(&handle.path, self.checkpoint.min_frames) {
                 error!("{}: checkpoint failed: {err}", handle.path);
             }
         }
     }
 
+    /// Uploads whatever the backups lack. Meant for shutdown.
+    pub fn flush_backups(&self) {
+        for handle in self.open_databases() {
+            if let Err(err) = handle.lock_idle().flush_backup() {
+                error!("{}: final backup upload failed: {err:#}", handle.path);
+            }
+        }
+    }
+
     pub(crate) fn handle_checkpoint(&self, db: &DbHandle) -> Result<HttpResponse> {
-        let outcome = db.state.lock().unwrap().checkpoint(&db.path, 1)?;
+        let outcome = db.lock_idle().checkpoint(&db.path, 1)?;
         let body = match outcome {
             CheckpointOutcome::Done {
                 generation,
@@ -285,7 +386,17 @@ impl TursoSyncServer {
                     if !dir.canonicalize().is_ok_and(|dir| dir.starts_with(base)) {
                         return Err(text_response(404, "Not Found"));
                     }
-                    match open_db_handle(&path, config) {
+                    let backup = config.backup.as_ref().map(|backup| backup.target.child(name));
+                    if let Some(target) = &backup {
+                        let restored = target
+                            .runtime()
+                            .block_on(replica::restore_missing(target, &path));
+                        if let Err(err) = restored {
+                            error!("failed to restore database {name}: {err:#}");
+                            return Err(text_response(503, "Service Unavailable"));
+                        }
+                    }
+                    match open_db_handle(&path, config, backup) {
                         Ok(handle) => Ok(handle),
                         // Sync clients retry a 500 forever but can act on a 404.
                         Err(err) if path.exists() => {
@@ -308,7 +419,11 @@ impl TursoSyncServer {
 
         debug!("Pipeline request: {:?}", req);
 
-        let mut state = db.state.lock().unwrap();
+        let mut state = if self.checkpoint.after_write {
+            db.lock_idle()
+        } else {
+            db.state.lock().unwrap()
+        };
         let conn = state.conn.clone();
 
         let mut results = Vec::new();
@@ -1469,7 +1584,11 @@ impl OpenHandles {
     }
 }
 
-fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
+fn open_db_handle(
+    path: &Path,
+    config: &OpenConfig,
+    backup: Option<Arc<Target>>,
+) -> Result<Arc<DbHandle>> {
     let path_str = path.to_string_lossy().to_string();
     let (_io, db) = Database::open_new(
         &path_str,
@@ -1483,11 +1602,10 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
     conn.wal_auto_actions_disable();
     let wal = conn.wal_state()?;
 
+    let persistent = path_str != ":memory:" && !config.flags.contains(OpenFlags::ReadOnly);
     let generations = if conn.mvcc_enabled() {
         None
     } else {
-        let persistent =
-            path_str != ":memory:" && !config.flags.contains(OpenFlags::ReadOnly);
         let mut generations = Generations::open(&path_str, persistent, config.keep_generations)?;
         if persistent {
             if let Some(identity) = generations.load_identity()? {
@@ -1509,7 +1627,26 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
         Some(generations)
     };
 
-    Ok(Arc::new(DbHandle {
+    let replica = match (backup, &generations, &config.backup) {
+        (Some(target), Some(generations), Some(backup_config)) if persistent => Some(Replica::open(
+            target,
+            &path_str,
+            generations.epoch(),
+            generations.current(),
+            backup_config.snapshot_interval,
+        )?),
+        (Some(_), None, _) => {
+            warn!("{path_str}: MVCC databases are not backed up");
+            None
+        }
+        _ => None,
+    };
+    let backup = replica
+        .as_ref()
+        .zip(config.backup.clone())
+        .map(|(replica, config)| (replica.target().clone(), config));
+
+    let handle = Arc::new(DbHandle {
         state: Mutex::new(DbState {
             conn,
             generations,
@@ -1517,9 +1654,84 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
             wal_salts_recorded: wal.max_frame > 0,
             pinned_until: None,
             last_checkpoint: Instant::now(),
+            replica,
         }),
+        backup_idle: Condvar::new(),
         path: path_str,
-    }))
+    });
+    if let Some((target, config)) = backup {
+        info!("{}: backing up to {target}", handle.path);
+        target
+            .runtime()
+            .spawn(back_up(handle.clone(), target.clone(), config));
+    }
+    Ok(handle)
+}
+
+/// Uploads new WAL frames and snapshots of one database in the background.
+async fn back_up(handle: Arc<DbHandle>, target: Arc<Target>, config: BackupConfig) {
+    let mut ticker = tokio::time::interval(config.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut backoff = Duration::ZERO;
+    loop {
+        ticker.tick().await;
+        tokio::time::sleep(backoff).await;
+        match back_up_pending(&handle).await {
+            Ok(snapshotted) => {
+                if !backoff.is_zero() {
+                    info!("{}: backup uploads to {target} work again", handle.path);
+                    backoff = Duration::ZERO;
+                }
+                if let (true, Some(retention)) = (snapshotted, config.retention) {
+                    match replica::prune(&target, retention).await {
+                        Ok(0) => {}
+                        Ok(removed) => {
+                            info!("{}: removed {removed} expired backup generations", handle.path)
+                        }
+                        Err(err) => warn!("{}: failed to prune the backup: {err:#}", handle.path),
+                    }
+                }
+            }
+            Err(err) => {
+                if backoff.is_zero() {
+                    error!("{}: backup upload to {target} failed, retrying: {err:#}", handle.path);
+                }
+                backoff = (backoff * 2).clamp(Duration::from_secs(1), BACKUP_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Runs backup jobs until nothing is left. Returns whether a new snapshot
+/// became restorable.
+async fn back_up_pending(handle: &Arc<DbHandle>) -> Result<bool> {
+    let mut snapshotted = false;
+    loop {
+        let db = handle.clone();
+        let job = tokio::task::spawn_blocking(move || -> Result<Option<Job>> {
+            let job = db.state.lock().unwrap().backup_job()?;
+            let Some(mut job) = job else {
+                return Ok(None);
+            };
+            match job.prepare() {
+                Ok(()) => Ok(Some(job)),
+                Err(err) => {
+                    db.finish_backup_job(&job, false)?;
+                    Err(err)
+                }
+            }
+        })
+        .await??;
+        let Some(job) = job else {
+            return Ok(snapshotted);
+        };
+        let result = job.run().await;
+        let succeeded = result.is_ok();
+        let db = handle.clone();
+        snapshotted |=
+            tokio::task::spawn_blocking(move || db.finish_backup_job(&job, succeeded)).await??;
+        result?;
+    }
 }
 
 fn encode_length_delimited(output: &mut Vec<u8>, data: &[u8]) {
@@ -1616,6 +1828,7 @@ mod tests {
                 db_opts: DatabaseOpts::new(),
                 max_open: TEST_MAX_OPEN,
                 keep_generations: 16,
+                backup: None,
             },
             CheckpointConfig {
                 interval: None,

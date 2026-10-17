@@ -9,7 +9,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/turso-sync-server /usr/local/bin/
 
 FROM debian:trixie-slim
-RUN useradd --uid 10001 --home-dir /data --no-create-home --shell /usr/sbin/nologin turso \
+# Root certificates for HTTPS to S3.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --home-dir /data --no-create-home --shell /usr/sbin/nologin turso \
     && mkdir /data \
     && chown turso /data
 COPY --from=build /usr/local/bin/turso-sync-server /usr/local/bin/
