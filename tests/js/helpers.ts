@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach } from 'vitest';
+import { afterEach, expect } from 'vitest';
 import { connect } from '@tursodatabase/sync';
 
 export const BINARY = process.env.LOCAL_SYNC_SERVER
@@ -88,6 +88,42 @@ export async function checkpoint(url: string): Promise<{ status: string, generat
     return resp.json();
 }
 
-export async function rows(db: Awaited<ReturnType<typeof connect>>, sql: string) {
+export type Db = Awaited<ReturnType<typeof connect>>;
+
+export const NO_TIMER = ['--checkpoint-interval', '0'];
+
+export async function rows(db: Db, sql: string) {
     return (await db.prepare(sql)).all();
+}
+
+// Rows are large enough to sit on pages of their own: a lost page then loses
+// a row, instead of being masked by a later copy of a shared page.
+export async function insert(db: Db, ...values: number[]) {
+    await db.exec(`INSERT INTO t VALUES ${values.map(v => `(${v}, randomblob(3000))`).join(', ')}`);
+    await db.push();
+}
+
+export async function values(db: Db): Promise<number[]> {
+    return (await rows(db, 'SELECT x FROM t ORDER BY x')).map((row: any) => row.x);
+}
+
+export function range(from: number, to: number): number[] {
+    return Array.from({ length: to - from + 1 }, (_, i) => from + i);
+}
+
+export async function syncedPair(url: string): Promise<{ writer: Db, reader: Db }> {
+    const writer = await connect({ path: ':memory:', url });
+    await writer.exec('CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)');
+    await insert(writer, 1);
+    const reader = await connect({ path: ':memory:', url });
+    expect(await values(reader)).toEqual([1]);
+    return { writer, reader };
+}
+
+export async function waitFor(condition: () => boolean, timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+        if (Date.now() > deadline) throw new Error('condition not met in time');
+        await new Promise(r => setTimeout(r, 100));
+    }
 }

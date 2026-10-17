@@ -1,17 +1,40 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { request } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterAll } from 'vitest';
 
 const ADMIN_URL = 'http://localhost:8081';
 
 const fileDbDirs: string[] = [];
-afterAll(() => {
+const fileDbServers: ChildProcess[] = [];
+afterAll(async () => {
+    if (process.env.SYNC_SERVER_BACKUP) {
+        // Servers upload the rest of their WAL while shutting down.
+        await Promise.all(fileDbServers.splice(0).map(c => c.exitCode === null ? once(c, 'exit') : null));
+        for (const dir of fileDbDirs) verifyBackup(dir);
+    }
     for (const dir of fileDbDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+
+/** A restore from the backup must reproduce the database file byte for byte. */
+function verifyBackup(dir: string) {
+    const database = join(dir, 'main.db');
+    if (!existsSync(database)) return;
+    const restored = join(dir, 'restored.db');
+    execFileSync(process.env.LOCAL_SYNC_SERVER!, ['restore', '--backup-url', join(dir, 'backup'), restored]);
+    // Reading through SQLite and closing folds the WAL into the database file.
+    const db = new DatabaseSync(database);
+    db.prepare('SELECT count(*) FROM sqlite_schema').get();
+    db.close();
+    if (!readFileSync(database).equals(readFileSync(restored))) {
+        throw new Error(`restoring ${database} from its backup gives a different file`);
+    }
+}
 const USER_URL = 'http://localhost:8080';
 
 function randomStr(): string {
@@ -102,10 +125,12 @@ export class TursoServer {
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 const port = await getFreePort();
                 let database = ':memory:';
+                const backupArgs: string[] = [];
                 if (process.env.SYNC_SERVER_FILE_DB) {
                     const dir = mkdtempSync(join(tmpdir(), 'turso-sync-suite-'));
                     fileDbDirs.push(dir);
                     database = join(dir, 'main.db');
+                    if (process.env.SYNC_SERVER_BACKUP) backupArgs.push('--backup-url', join(dir, 'backup'));
                 }
                 const child = spawn(localSyncServer, [
                     database,
@@ -113,11 +138,13 @@ export class TursoServer {
                     // enable experimental features on the server so synced clients
                     // can push schemas that use them (e.g. generated columns)
                     '--experimental-generated-columns',
+                    ...backupArgs,
                     ...(opts.args ?? []),
                     ...(process.env.SYNC_SERVER_ARGS?.split(' ').filter(Boolean) ?? []),
                 ], {
                     stdio: process.env.SYNC_SERVER_LOGS ? 'inherit' : 'ignore',
                 });
+                if (process.env.SYNC_SERVER_FILE_DB) fileDbServers.push(child);
                 const userUrl = `http://localhost:${port}`;
                 const deadline = Date.now() + 30000;
                 let ready = false;

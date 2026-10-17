@@ -3,43 +3,10 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { expect, test } from 'vitest';
 import { connect } from '@tursodatabase/sync';
-import { checkpoint, pipeline, rows, startServer, stopServer, tempDir } from './helpers.js';
-
-type Db = Awaited<ReturnType<typeof connect>>;
-
-const NO_TIMER = ['--checkpoint-interval', '0'];
-
-// Rows are large enough to sit on pages of their own: a lost page then loses
-// a row, instead of being masked by a later copy of a shared page.
-async function insert(db: Db, ...values: number[]) {
-    await db.exec(`INSERT INTO t VALUES ${values.map(v => `(${v}, randomblob(3000))`).join(', ')}`);
-    await db.push();
-}
-
-async function values(db: Db): Promise<number[]> {
-    return (await rows(db, 'SELECT x FROM t ORDER BY x')).map((row: any) => row.x);
-}
-
-function range(from: number, to: number): number[] {
-    return Array.from({ length: to - from + 1 }, (_, i) => from + i);
-}
-
-async function syncedPair(url: string): Promise<{ writer: Db, reader: Db }> {
-    const writer = await connect({ path: ':memory:', url });
-    await writer.exec('CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)');
-    await insert(writer, 1);
-    const reader = await connect({ path: ':memory:', url });
-    expect(await values(reader)).toEqual([1]);
-    return { writer, reader };
-}
-
-async function waitFor(condition: () => boolean, timeoutMs: number) {
-    const deadline = Date.now() + timeoutMs;
-    while (!condition()) {
-        if (Date.now() > deadline) throw new Error('condition not met in time');
-        await new Promise(r => setTimeout(r, 100));
-    }
-}
+import {
+    NO_TIMER, checkpoint, insert, pipeline, range, rows, startServer, stopServer, syncedPair, tempDir,
+    values, waitFor,
+} from './helpers.js';
 
 test('clients catch up across several checkpoints', async () => {
     const dbPath = join(tempDir(), 'main.db');
