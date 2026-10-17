@@ -1,0 +1,15 @@
+{
+  "name": "turso-sync-server-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "LOCAL_SYNC_SERVER=${LOCAL_SYNC_SERVER:-../../target/release/turso-sync-server} vitest --run"
+  },
+  "dependencies": {
+    "@tursodatabase/sync": "0.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.2",
+    "vitest": "^4.1.11"
+  }
+}
