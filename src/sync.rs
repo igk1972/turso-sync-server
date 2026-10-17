@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -9,9 +10,11 @@ use roaring::RoaringBitmap;
 use tracing::{debug, error, info, warn};
 
 use turso_core::{
-    Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value as CoreValue,
+    CheckpointMode, Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect,
+    Value as CoreValue,
 };
 
+use crate::generations::{Generations, Revision, SealedPages};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
     ExecuteStreamReq, ExecuteStreamResp, MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto,
@@ -36,12 +39,24 @@ const MVCC_TX_HEADER_SIZE: usize = 24;
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
+/// Chunked bootstraps pin later chunks to the revision of the first one, and a
+/// checkpoint in between would make that revision unreadable. Pinned reads and
+/// page-selector reads therefore hold checkpoints off for this long.
+const PINNED_READ_LEASE: Duration = Duration::from_secs(60);
 
 pub struct OpenConfig {
     pub vfs: Option<String>,
     pub flags: OpenFlags,
     pub db_opts: DatabaseOpts,
     pub max_open: usize,
+    pub keep_generations: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointConfig {
+    pub interval: Option<Duration>,
+    pub min_frames: u64,
+    pub after_write: bool,
 }
 
 pub(crate) struct DbHandle {
@@ -51,6 +66,90 @@ pub(crate) struct DbHandle {
 
 struct DbState {
     conn: Arc<Connection>,
+    /// `None` for MVCC databases, which keep the upstream single-generation behaviour.
+    generations: Option<Generations>,
+    checkpoint_seq: u32,
+    wal_salts_recorded: bool,
+    pinned_until: Option<Instant>,
+    last_checkpoint: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointOutcome {
+    Done {
+        generation: u64,
+        frames: u64,
+        pages: u64,
+    },
+    Deferred,
+    Skipped,
+}
+
+impl DbState {
+    /// Seals the current generation and truncates the WAL.
+    fn checkpoint(&mut self, path: &str, min_frames: u64) -> Result<CheckpointOutcome> {
+        let Some(generations) = self.generations.as_mut() else {
+            return Ok(CheckpointOutcome::Skipped);
+        };
+        if self.pinned_until.is_some_and(|until| Instant::now() < until) {
+            return Ok(CheckpointOutcome::Deferred);
+        }
+        let wal = self.conn.wal_state()?;
+        if wal.max_frame == 0 || wal.max_frame < min_frames {
+            return Ok(CheckpointOutcome::Skipped);
+        }
+        let pages: RoaringBitmap = self.conn.wal_changed_pages_after(0)?.into_iter().collect();
+        let page_count = pages.len();
+        generations.seal(SealedPages::Known(pages))?;
+        // The bound makes the checkpoint fail rather than fold frames that are
+        // missing from the sealed page set. A failure leaves the WAL in place,
+        // which is safe: the next generation then repeats those pages.
+        let result = self.conn.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: Some(wal.max_frame),
+        });
+        let after = self.conn.wal_state()?;
+        self.checkpoint_seq = after.checkpoint_seq_no;
+        generations.store_identity(after.checkpoint_seq_no, after.max_frame > 0)?;
+        self.wal_salts_recorded = after.max_frame > 0;
+        self.last_checkpoint = Instant::now();
+        if let Err(err) = result {
+            return Err(anyhow!("checkpoint failed, the WAL is kept: {err}"));
+        }
+        info!(
+            "{path}: checkpointed {} frames ({page_count} pages), generation {}",
+            wal.max_frame,
+            generations.current()
+        );
+        Ok(CheckpointOutcome::Done {
+            generation: generations.current(),
+            frames: wal.max_frame,
+            pages: page_count,
+        })
+    }
+
+    /// Tracks the WAL after a write request: a reset that did not come from
+    /// [`DbState::checkpoint`] loses the pages it folded, so the generation is
+    /// sealed as unknown and older clients download everything again.
+    fn after_write(&mut self, path: &str, config: &CheckpointConfig) -> Result<()> {
+        let Some(generations) = self.generations.as_mut() else {
+            return Ok(());
+        };
+        let wal = self.conn.wal_state()?;
+        if wal.checkpoint_seq_no != self.checkpoint_seq {
+            warn!("{path}: a request reset the WAL; clients will download the database again");
+            generations.seal(SealedPages::Unknown)?;
+            self.checkpoint_seq = wal.checkpoint_seq_no;
+            generations.store_identity(wal.checkpoint_seq_no, wal.max_frame > 0)?;
+            self.wal_salts_recorded = wal.max_frame > 0;
+        } else if wal.max_frame > 0 && !self.wal_salts_recorded {
+            generations.store_identity(wal.checkpoint_seq_no, true)?;
+            self.wal_salts_recorded = true;
+        }
+        if config.after_write {
+            self.checkpoint(path, 1)?;
+        }
+        Ok(())
+    }
 }
 
 struct OpenHandles {
@@ -69,16 +168,22 @@ enum DbSource {
 
 pub struct TursoSyncServer {
     source: DbSource,
+    checkpoint: CheckpointConfig,
 }
 
 impl TursoSyncServer {
-    pub fn new(db_path: &str, config: &OpenConfig) -> Result<Self> {
+    pub fn new(db_path: &str, config: &OpenConfig, checkpoint: CheckpointConfig) -> Result<Self> {
         Ok(Self {
             source: DbSource::Single(open_db_handle(Path::new(db_path), config)?),
+            checkpoint,
         })
     }
 
-    pub fn new_dir(base: PathBuf, config: OpenConfig) -> Result<Self> {
+    pub fn new_dir(
+        base: PathBuf,
+        config: OpenConfig,
+        checkpoint: CheckpointConfig,
+    ) -> Result<Self> {
         if !base.is_dir() {
             return Err(anyhow!(
                 "sync dir path does not exist or is not a directory: {}",
@@ -92,6 +197,56 @@ impl TursoSyncServer {
                 config,
                 open_handles,
             },
+            checkpoint,
+        })
+    }
+
+    fn open_databases(&self) -> Vec<Arc<DbHandle>> {
+        match &self.source {
+            DbSource::Single(handle) => vec![handle.clone()],
+            DbSource::Dir { open_handles, .. } => {
+                open_handles.lock().unwrap().handles.values().cloned().collect()
+            }
+        }
+    }
+
+    /// Checkpoints every open database whose last checkpoint is older than the
+    /// configured interval and whose WAL holds enough frames.
+    pub fn run_due_checkpoints(&self) {
+        let Some(interval) = self.checkpoint.interval else {
+            return;
+        };
+        for handle in self.open_databases() {
+            let mut state = handle.state.lock().unwrap();
+            if state.last_checkpoint.elapsed() < interval {
+                continue;
+            }
+            if let Err(err) = state.checkpoint(&handle.path, self.checkpoint.min_frames) {
+                error!("{}: checkpoint failed: {err}", handle.path);
+            }
+        }
+    }
+
+    pub(crate) fn handle_checkpoint(&self, db: &DbHandle) -> Result<HttpResponse> {
+        let outcome = db.state.lock().unwrap().checkpoint(&db.path, 1)?;
+        let body = match outcome {
+            CheckpointOutcome::Done {
+                generation,
+                frames,
+                pages,
+            } => serde_json::json!({
+                "status": "done",
+                "generation": generation,
+                "frames": frames,
+                "pages": pages,
+            }),
+            CheckpointOutcome::Deferred => serde_json::json!({ "status": "deferred" }),
+            CheckpointOutcome::Skipped => serde_json::json!({ "status": "skipped" }),
+        };
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/json".to_string(),
+            body: serde_json::to_vec(&body)?,
         })
     }
 
@@ -153,7 +308,7 @@ impl TursoSyncServer {
 
         debug!("Pipeline request: {:?}", req);
 
-        let state = db.state.lock().unwrap();
+        let mut state = db.state.lock().unwrap();
         let conn = state.conn.clone();
 
         let mut results = Vec::new();
@@ -180,6 +335,7 @@ impl TursoSyncServer {
                 error!("failed to roll back a dangling transaction: {err}");
             }
         }
+        state.after_write(&db.path, &self.checkpoint)?;
 
         let resp = PipelineRespBody {
             baton: req.baton,
@@ -467,7 +623,150 @@ impl TursoSyncServer {
             return self.handle_logical_pull_updates(db, &req);
         }
 
+        {
+            let mut state = db.state.lock().unwrap();
+            if state.generations.is_some() {
+                return self.handle_generation_pull_updates(&mut state, &req);
+            }
+        }
         self.handle_page_pull_updates(db, &req, PullUpdatesApplyMode::Incremental)
+    }
+
+    /// Page pull for WAL databases: revisions carry the generation, and pages
+    /// are read at the revision's frame from the database file and the WAL.
+    fn handle_generation_pull_updates(
+        &self,
+        state: &mut DbState,
+        req: &PullUpdatesReqProtoBody,
+    ) -> Result<HttpResponse> {
+        let conn = state.conn.clone();
+        let generations = state
+            .generations
+            .as_ref()
+            .expect("caller checked generations");
+        let (epoch, current) = (generations.epoch(), generations.current());
+        let max_frame = conn.wal_state()?.max_frame;
+
+        let pinned = !req.server_revision.is_empty();
+        let watermark = if pinned {
+            match Revision::parse(&req.server_revision) {
+                Revision::Generation {
+                    epoch: e,
+                    generation,
+                    frame,
+                } if e == epoch && generation == current && frame <= max_frame => frame,
+                Revision::Legacy(frame) if current == 0 && frame <= max_frame => frame,
+                _ => {
+                    info!(
+                        "pinned revision {} is no longer readable (current {})",
+                        req.server_revision,
+                        generations.revision(max_frame)
+                    );
+                    return Ok(text_response(
+                        410,
+                        "Revision is no longer available, restart the sync",
+                    ));
+                }
+            }
+        } else {
+            max_frame
+        };
+
+        let selector: Option<RoaringBitmap> = if req.server_pages_selector.is_empty() {
+            None
+        } else {
+            Some(
+                RoaringBitmap::deserialize_from(&req.server_pages_selector[..])
+                    .map_err(|e| anyhow!("Failed to parse server_pages_selector: {}", e))?,
+            )
+        };
+
+        // 1-based page numbers changed since the client revision; `None` means
+        // the client has to receive every page.
+        let changed: Option<RoaringBitmap> = match Revision::parse(&req.client_revision) {
+            Revision::Legacy(frame) if current == 0 && frame <= watermark => {
+                Some(conn.wal_changed_pages_after(frame)?.into_iter().collect())
+            }
+            Revision::Generation {
+                epoch: e,
+                generation,
+                frame,
+            } if e == epoch => {
+                if generation == current && frame <= watermark {
+                    Some(conn.wal_changed_pages_after(frame)?.into_iter().collect())
+                } else if generation < current {
+                    match generations.changed_since(generation)? {
+                        Some(mut sealed) => {
+                            sealed.extend(conn.wal_changed_pages_after(0)?);
+                            Some(sealed)
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if changed.is_none() && !req.client_revision.is_empty() {
+            info!(
+                "client revision {} predates the known history, sending the whole database",
+                req.client_revision
+            );
+        }
+
+        let db_size = current_snapshot_db_size_pages(&conn, watermark)?;
+        let candidates: Box<dyn Iterator<Item = u32>> = match changed {
+            Some(pages) => Box::new(pages.into_iter().filter(move |p| u64::from(*p) <= db_size)),
+            None => Box::new(1..=u32::try_from(db_size)?),
+        };
+        let mut response_body = Vec::new();
+        let header = PullUpdatesRespProtoBody {
+            server_revision: Revision::format(epoch, current, watermark),
+            db_size,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+            protocol: PullUpdatesProtocol::Pages as i32,
+        };
+        encode_length_delimited(&mut response_body, &header.encode_to_vec());
+
+        let mut page = vec![0u8; PAGE_SIZE];
+        let mut sent = 0usize;
+        for page_no in candidates {
+            if selector
+                .as_ref()
+                .is_some_and(|selector| !selector.contains(page_no - 1))
+            {
+                continue;
+            }
+            if !conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
+                return Err(anyhow!(
+                    "page {page_no} is missing at frame {watermark} of generation {current}"
+                ));
+            }
+            let page_msg = PageData {
+                page_id: u64::from(page_no - 1),
+                encoded_page: Bytes::copy_from_slice(&page),
+            };
+            encode_length_delimited(&mut response_body, &page_msg.encode_to_vec());
+            sent += 1;
+        }
+        if pinned || selector.is_some() {
+            state.pinned_until = Some(Instant::now() + PINNED_READ_LEASE);
+        }
+        debug!(
+            "pull-updates: client_revision={:?} server_revision={} pages={sent} db_size={db_size}",
+            req.client_revision, header.server_revision
+        );
+
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/protobuf".to_string(),
+            body: response_body,
+        })
     }
 
     fn handle_page_pull_updates(
@@ -1182,9 +1481,43 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
     )?;
     let conn = db.connect()?;
     conn.wal_auto_actions_disable();
+    let wal = conn.wal_state()?;
+
+    let generations = if conn.mvcc_enabled() {
+        None
+    } else {
+        let persistent =
+            path_str != ":memory:" && !config.flags.contains(OpenFlags::ReadOnly);
+        let mut generations = Generations::open(&path_str, persistent, config.keep_generations)?;
+        if persistent {
+            if let Some(identity) = generations.load_identity()? {
+                if let Some(reason) = generations.detect_offline_change(&identity) {
+                    warn!(
+                        "{path_str}: {reason} while the server was down; \
+                         clients will download the database again"
+                    );
+                    generations.seal(SealedPages::Unknown)?;
+                }
+            }
+            generations.store_identity(wal.checkpoint_seq_no, wal.max_frame > 0)?;
+        }
+        info!(
+            "{path_str}: generation {}, {} WAL frames",
+            generations.current(),
+            wal.max_frame
+        );
+        Some(generations)
+    };
 
     Ok(Arc::new(DbHandle {
-        state: Mutex::new(DbState { conn }),
+        state: Mutex::new(DbState {
+            conn,
+            generations,
+            checkpoint_seq: wal.checkpoint_seq_no,
+            wal_salts_recorded: wal.max_frame > 0,
+            pinned_until: None,
+            last_checkpoint: Instant::now(),
+        }),
         path: path_str,
     }))
 }
@@ -1282,6 +1615,12 @@ mod tests {
                 flags: OpenFlags::default(),
                 db_opts: DatabaseOpts::new(),
                 max_open: TEST_MAX_OPEN,
+                keep_generations: 16,
+            },
+            CheckpointConfig {
+                interval: None,
+                min_frames: 1,
+                after_write: false,
             },
         )
         .unwrap()

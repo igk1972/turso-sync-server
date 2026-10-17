@@ -1,3 +1,4 @@
+mod generations;
 mod http;
 mod sync;
 
@@ -15,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 use turso_core::{DatabaseOpts, OpenFlags};
 
 use crate::http::AppState;
-use crate::sync::{OpenConfig, TursoSyncServer};
+use crate::sync::{CheckpointConfig, OpenConfig, TursoSyncServer};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -76,6 +77,30 @@ struct Opts {
         help = "Seconds allowed to receive and process one request"
     )]
     request_timeout: u64,
+    #[arg(
+        long,
+        env = "TURSO_SYNC_CHECKPOINT_INTERVAL",
+        default_value_t = 300,
+        help = "Seconds between checkpoints of a database (0 disables periodic checkpoints)"
+    )]
+    checkpoint_interval: u64,
+    #[arg(
+        long,
+        env = "TURSO_SYNC_CHECKPOINT_MIN_FRAMES",
+        default_value_t = 1000,
+        help = "Skip a periodic checkpoint while the WAL holds fewer frames"
+    )]
+    checkpoint_min_frames: u64,
+    #[arg(
+        long,
+        env = "TURSO_SYNC_KEEP_GENERATIONS",
+        default_value_t = 1000,
+        help = "Checkpoint generations to remember; older clients download the whole database"
+    )]
+    keep_generations: usize,
+    /// Checkpoint after every write request (for testing).
+    #[arg(long, hide = true)]
+    checkpoint_after_write: bool,
     #[arg(long, env = "TURSO_SYNC_VFS")]
     vfs: Option<String>,
     #[arg(long)]
@@ -129,6 +154,16 @@ impl Opts {
                     self.experimental_mvcc_passive_checkpoint,
                 ),
             max_open: self.sync_max_databases,
+            keep_generations: self.keep_generations.max(1),
+        }
+    }
+
+    fn checkpoint_config(&self) -> CheckpointConfig {
+        CheckpointConfig {
+            interval: (self.checkpoint_interval > 0)
+                .then(|| Duration::from_secs(self.checkpoint_interval)),
+            min_frames: self.checkpoint_min_frames,
+            after_write: self.checkpoint_after_write,
         }
     }
 
@@ -188,15 +223,16 @@ async fn main() -> Result<()> {
     }
     let auth_token = opts.auth_token()?;
     let config = opts.open_config();
+    let checkpoint = opts.checkpoint_config();
 
     let server = match (&opts.sync_dir, &opts.database) {
         (Some(dir), _) => {
             info!("serving databases under {}", dir.display());
-            TursoSyncServer::new_dir(dir.clone(), config)?
+            TursoSyncServer::new_dir(dir.clone(), config, checkpoint)?
         }
         (None, Some(path)) => {
             info!("serving database {path}");
-            TursoSyncServer::new(path, &config)?
+            TursoSyncServer::new(path, &config, checkpoint)?
         }
         (None, None) => return Err(anyhow!("a database path or --sync-dir is required")),
     };
@@ -209,6 +245,18 @@ async fn main() -> Result<()> {
         auth_token,
         request_timeout: Duration::from_secs(opts.request_timeout),
     });
+    if let Some(interval) = checkpoint.interval {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval.min(Duration::from_secs(10)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let state = state.clone();
+                let _ = tokio::task::spawn_blocking(move || state.server.run_due_checkpoints()).await;
+            }
+        });
+    }
     let app = http::router(state, opts.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(&opts.listen)
         .await

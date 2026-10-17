@@ -23,6 +23,7 @@ pub struct AppState {
 enum Endpoint {
     Pipeline,
     PullUpdates,
+    Checkpoint,
 }
 
 pub fn router(state: Arc<AppState>, max_request_bytes: usize) -> Router {
@@ -31,6 +32,8 @@ pub fn router(state: Arc<AppState>, max_request_bytes: usize) -> Router {
         .route("/pull-updates", post(pull_updates))
         .route("/db/{name}/v2/pipeline", post(named_pipeline))
         .route("/db/{name}/pull-updates", post(named_pull_updates))
+        .route("/admin/checkpoint", post(checkpoint))
+        .route("/db/{name}/admin/checkpoint", post(named_checkpoint))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -66,6 +69,14 @@ async fn named_pull_updates(
     dispatch(state, Some(name), Endpoint::PullUpdates, body).await
 }
 
+async fn checkpoint(State(state): State<Arc<AppState>>) -> Response {
+    dispatch(state, None, Endpoint::Checkpoint, Bytes::new()).await
+}
+
+async fn named_checkpoint(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    dispatch(state, Some(name), Endpoint::Checkpoint, Bytes::new()).await
+}
+
 async fn dispatch(
     state: Arc<AppState>,
     db: Option<String>,
@@ -80,6 +91,7 @@ async fn dispatch(
         match endpoint {
             Endpoint::Pipeline => state.server.handle_pipeline(&handle, &body),
             Endpoint::PullUpdates => state.server.handle_pull_updates(&handle, &body),
+            Endpoint::Checkpoint => state.server.handle_checkpoint(&handle),
         }
     })
     .await;
