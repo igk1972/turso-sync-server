@@ -1,5 +1,6 @@
 mod generations;
 mod http;
+mod metrics;
 mod replica;
 mod sync;
 
@@ -47,6 +48,12 @@ struct Opts {
         default_value = "0.0.0.0:8080"
     )]
     listen: String,
+    #[arg(
+        long,
+        env = "TURSO_SYNC_METRICS_LISTEN",
+        help = "Serve Prometheus metrics on ADDR at /metrics, without authentication"
+    )]
+    metrics_listen: Option<String>,
     #[arg(
         long,
         env = "TURSO_SYNC_DIR",
@@ -339,6 +346,18 @@ async fn main() -> Result<()> {
                 ticker.tick().await;
                 let state = state.clone();
                 let _ = tokio::task::spawn_blocking(move || state.server.run_due_checkpoints()).await;
+            }
+        });
+    }
+    if let Some(addr) = &opts.metrics_listen {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to listen on {addr}"))?;
+        info!("serving metrics on {}", listener.local_addr()?);
+        let router = http::metrics_router(state.clone());
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, router).await {
+                warn!("metrics listener stopped: {err}");
             }
         });
     }

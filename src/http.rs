@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tracing::{error, info};
 
+use crate::metrics::{self, metrics, EndpointLabels, RequestLabels};
 use crate::sync::{HttpResponse, TursoSyncServer};
 
 pub struct AppState {
@@ -43,6 +44,30 @@ pub fn router(state: Arc<AppState>, max_request_bytes: usize) -> Router {
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(middleware::from_fn_with_state(state.clone(), cors_and_access_log))
         .with_state(state)
+}
+
+/// Served on its own listener, without authentication: the client token
+/// grants full access to the databases and does not belong in a scraper.
+pub fn metrics_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/metrics", get(serve_metrics))
+        .fallback(|| async { (StatusCode::NOT_FOUND, "Not Found") })
+        .with_state(state)
+}
+
+async fn serve_metrics(State(state): State<Arc<AppState>>) -> Response {
+    let refreshed = tokio::task::spawn_blocking(move || state.server.refresh_metrics()).await;
+    if let Err(err) = refreshed {
+        error!("metrics refresh failed: {err}");
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        metrics().encode(),
+    )
+        .into_response()
 }
 
 async fn pipeline(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
@@ -171,6 +196,17 @@ async fn cors_and_access_log(
         HeaderValue::from_static("Authorization, *"),
     );
     headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("*"));
+
+    let endpoint = metrics::endpoint(&path);
+    let status = resp.status().as_u16();
+    metrics()
+        .requests
+        .get_or_create(&RequestLabels { endpoint, status })
+        .inc();
+    metrics()
+        .request_duration
+        .get_or_create(&EndpointLabels { endpoint })
+        .observe(started.elapsed().as_secs_f64());
 
     if path != "/health" {
         info!(

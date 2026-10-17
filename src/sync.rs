@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use turso_core::{
 };
 
 use crate::generations::{Generations, Revision, SealedPages};
+use crate::metrics::{self, metrics, CheckpointLabels};
 use crate::replica::{self, Job, Replica, Target};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
@@ -47,6 +48,8 @@ const PINNED_READ_LEASE: Duration = Duration::from_secs(60);
 /// How long a checkpoint waits for a backup upload running without the lock.
 const BACKUP_IDLE_WAIT: Duration = Duration::from_secs(30);
 const BACKUP_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How long one scrape waits in total for busy databases.
+const METRICS_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 pub struct OpenConfig {
     pub vfs: Option<String>,
@@ -107,6 +110,7 @@ struct DbState {
     wal_salts_recorded: bool,
     pinned_until: Option<Instant>,
     last_checkpoint: Instant,
+    last_checkpoint_at: Option<SystemTime>,
     replica: Option<Replica>,
 }
 
@@ -122,8 +126,24 @@ pub(crate) enum CheckpointOutcome {
 }
 
 impl DbState {
-    /// Seals the current generation and truncates the WAL.
     fn checkpoint(&mut self, path: &str, min_frames: u64) -> Result<CheckpointOutcome> {
+        let result = self.try_checkpoint(path, min_frames);
+        let outcome = match &result {
+            Ok(CheckpointOutcome::Done { .. }) => "done",
+            Ok(CheckpointOutcome::Deferred) => "deferred",
+            Ok(CheckpointOutcome::Skipped) => return result,
+            Err(_) => "failed",
+        };
+        let labels = CheckpointLabels {
+            db: path.to_string(),
+            outcome,
+        };
+        metrics().checkpoints.get_or_create(&labels).inc();
+        result
+    }
+
+    /// Seals the current generation and truncates the WAL.
+    fn try_checkpoint(&mut self, path: &str, min_frames: u64) -> Result<CheckpointOutcome> {
         let Some(generations) = self.generations.as_mut() else {
             return Ok(CheckpointOutcome::Skipped);
         };
@@ -165,6 +185,7 @@ impl DbState {
         generations.store_identity(after.checkpoint_seq_no, after.max_frame > 0)?;
         self.wal_salts_recorded = after.max_frame > 0;
         self.last_checkpoint = Instant::now();
+        self.last_checkpoint_at = Some(SystemTime::now());
         if let Some(replica) = self.replica.as_mut() {
             replica.on_checkpoint(generations.epoch(), generations.current(), backed_up)?;
         }
@@ -227,6 +248,32 @@ impl DbState {
                 Err(err.into())
             }
         }
+    }
+
+    fn refresh_metrics(&self, path: &str) -> Result<()> {
+        let m = metrics();
+        let labels = metrics::db(path);
+        let wal = self.conn.wal_state()?;
+        m.wal_frames.get_or_create(&labels).set(wal.max_frame as i64);
+        if let Some(generations) = &self.generations {
+            m.generation.get_or_create(&labels).set(generations.current() as i64);
+        }
+        if let Some(at) = self.last_checkpoint_at {
+            m.last_checkpoint.get_or_create(&labels).set(metrics::unix_seconds(at));
+        }
+        if let Some(replica) = &self.replica {
+            let pending = replica.pending_frames(wal.max_frame);
+            m.backup_pending_frames.get_or_create(&labels).set(pending as i64);
+            let snapshot_pending = i64::from(replica.snapshot_pending());
+            m.backup_snapshot_pending.get_or_create(&labels).set(snapshot_pending);
+            if let Some(at) = replica.synced_at() {
+                m.backup_synced.get_or_create(&labels).set(metrics::unix_seconds(at));
+            }
+            if let Some(at) = replica.snapshot_at() {
+                m.backup_last_snapshot.get_or_create(&labels).set(metrics::unix_seconds(at));
+            }
+        }
+        Ok(())
     }
 
     /// Uploads what the backup lacks, a snapshot included.
@@ -315,6 +362,32 @@ impl TursoSyncServer {
             let mut state = handle.lock_idle();
             if let Err(err) = state.checkpoint(&handle.path, self.checkpoint.min_frames) {
                 error!("{}: checkpoint failed: {err}", handle.path);
+            }
+        }
+    }
+
+    /// Updates the database gauges. Locks are held briefly most of the time;
+    /// a database busy past the deadline keeps its previous values rather
+    /// than holding up the scrape.
+    pub fn refresh_metrics(&self) {
+        let databases = self.open_databases();
+        metrics().open_databases.set(databases.len() as i64);
+        let deadline = Instant::now() + METRICS_LOCK_WAIT;
+        for handle in databases {
+            let state = loop {
+                match handle.state.try_lock() {
+                    Ok(state) => break Some(state),
+                    Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(state) = state else {
+                continue;
+            };
+            if let Err(err) = state.refresh_metrics(&handle.path) {
+                warn!("{}: failed to read metrics: {err}", handle.path);
             }
         }
     }
@@ -1656,6 +1729,7 @@ fn open_db_handle(
             wal_salts_recorded: wal.max_frame > 0,
             pinned_until: None,
             last_checkpoint: Instant::now(),
+            last_checkpoint_at: None,
             replica,
         }),
         backup_idle: Condvar::new(),

@@ -24,7 +24,7 @@ export function tempDir(): string {
     return dir;
 }
 
-function freePort(): Promise<number> {
+export function freePort(): Promise<number> {
     return new Promise((resolve, reject) => {
         const server = createServer();
         server.unref();

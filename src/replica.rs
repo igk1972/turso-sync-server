@@ -28,7 +28,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
@@ -43,6 +43,7 @@ use turso_core::types::WalState;
 use turso_core::Connection;
 
 use crate::generations::write_atomic;
+use crate::metrics::{metrics, UploadLabels};
 
 const STATE_FILE: &str = "backup";
 const RESTORED_FILE: &str = "backup-restored";
@@ -345,6 +346,8 @@ pub struct Replica {
     state: State,
     busy: bool,
     snapshot_interval: Duration,
+    /// When the backup last held every committed frame.
+    synced_at: Option<SystemTime>,
 }
 
 impl Replica {
@@ -391,6 +394,7 @@ impl Replica {
             state,
             busy: false,
             snapshot_interval,
+            synced_at: None,
         };
         replica.align(epoch, generation, None);
         replica.persist()?;
@@ -412,6 +416,41 @@ impl Replica {
 
     fn persist(&self) -> Result<()> {
         write_atomic(&self.state_path, self.state.encode().as_bytes())
+    }
+
+    /// Committed frames of the current WAL that the backup lacks.
+    pub fn pending_frames(&self, max_frame: u64) -> u64 {
+        let shipped = if self.state.established { self.state.shipped } else { 0 };
+        max_frame.saturating_sub(shipped)
+    }
+
+    /// Whether the backup cannot restore the current generation until a
+    /// snapshot is uploaded.
+    pub fn snapshot_pending(&self) -> bool {
+        match self.state.id {
+            Some(_) => self.state.meta.is_none(),
+            None => self.state.parent.is_none(),
+        }
+    }
+
+    pub fn synced_at(&self) -> Option<SystemTime> {
+        self.synced_at
+    }
+
+    /// When the chain last started from a snapshot.
+    pub fn snapshot_at(&self) -> Option<SystemTime> {
+        u64::try_from(self.state.snapshot_at)
+            .ok()
+            .filter(|secs| *secs > 0)
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    /// No upload to do right now; notes whether that means the backup is complete.
+    fn idle(&mut self, max_frame: u64) -> Option<Job> {
+        if self.pending_frames(max_frame) == 0 && !self.snapshot_pending() {
+            self.synced_at = Some(SystemTime::now());
+        }
+        None
     }
 
     fn snapshot_due(&self) -> bool {
@@ -457,10 +496,10 @@ impl Replica {
         if self.state.id.is_none() {
             let continues = self.state.parent.clone().filter(|_| !self.snapshot_due());
             if continues.is_some() && wal.max_frame == 0 {
-                return Ok(None);
+                return Ok(self.idle(wal.max_frame));
             }
             if continues.is_none() && !allow_snapshot {
-                return Ok(None);
+                return Ok(self.idle(wal.max_frame));
             }
             let id = new_id(epoch, generation, self.state.last_id.as_deref());
             self.state.id = Some(id.clone());
@@ -471,7 +510,7 @@ impl Replica {
         let id = self.state.id.clone().expect("assigned above");
         let Some(meta) = self.state.meta.clone() else {
             if !allow_snapshot {
-                return Ok(None);
+                return Ok(self.idle(wal.max_frame));
             }
             self.busy = true;
             return Ok(Some(Job::Snapshot {
@@ -490,7 +529,7 @@ impl Replica {
             None
         };
         if meta.is_none() && segment.is_none() {
-            return Ok(None);
+            return Ok(self.idle(wal.max_frame));
         }
         self.busy = true;
         Ok(Some(Job::Upload {
@@ -509,6 +548,16 @@ impl Replica {
     /// a new snapshot became restorable.
     pub fn finish(&mut self, job: &Job, succeeded: bool, wal: &WalState) -> Result<bool> {
         self.busy = false;
+        let labels = UploadLabels {
+            db: self.db_file.display().to_string(),
+            kind: job.kind(),
+            result: if succeeded { "ok" } else { "error" },
+        };
+        metrics().backup_uploads.get_or_create(&labels).inc();
+        if let (true, Job::Upload { segment: Some(segment), .. }) = (succeeded, job) {
+            let bytes = segment.compressed.as_ref().map_or(0, Vec::len);
+            metrics().backup_uploaded_bytes.get_or_create(&labels).inc_by(bytes as u64);
+        }
         if !succeeded || self.state.id.as_deref() != Some(job.id()) {
             return Ok(false);
         }
@@ -643,6 +692,13 @@ impl Job {
         }
     }
 
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Snapshot { .. } => "snapshot",
+            Self::Upload { .. } => "frames",
+        }
+    }
+
     /// CPU work that should not hold the database lock.
     pub fn prepare(&mut self) -> Result<()> {
         if let Self::Upload {
@@ -711,6 +767,7 @@ fn upload_snapshot(target: &Target, id: &str, db_file: &FsPath) -> Result<()> {
     let location = target.generation(id).join("snapshot.zst");
     let upload = runtime.block_on(target.store.put_multipart(&location))?;
     let mut writer = WriteMultipart::new_with_chunk_size(upload, SNAPSHOT_PART_SIZE);
+    let mut uploaded = 0;
     let mut write = || -> Result<()> {
         let mut encoder = zstd::Encoder::new(Vec::new(), ZSTD_LEVEL)?;
         encoder.include_checksum(true)?;
@@ -729,15 +786,24 @@ fn upload_snapshot(target: &Target, id: &str, db_file: &FsPath) -> Result<()> {
             if encoder.get_ref().len() >= SNAPSHOT_PART_SIZE {
                 runtime.block_on(writer.wait_for_capacity(4))?;
                 writer.write(encoder.get_ref());
+                uploaded += encoder.get_ref().len();
                 encoder.get_mut().clear();
             }
         }
-        writer.write(&encoder.finish()?);
+        let rest = encoder.finish()?;
+        writer.write(&rest);
+        uploaded += rest.len();
         Ok(())
     };
     match write() {
         Ok(()) => {
             runtime.block_on(writer.finish())?;
+            let labels = UploadLabels {
+                db: db_file.display().to_string(),
+                kind: "snapshot",
+                result: "ok",
+            };
+            metrics().backup_uploaded_bytes.get_or_create(&labels).inc_by(uploaded as u64);
             Ok(())
         }
         Err(err) => {

@@ -4,7 +4,7 @@ import { connect as netConnect, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { connect } from '@tursodatabase/sync';
-import { pipeline, rows, startServer, stopServer, tempDir } from './helpers.js';
+import { freePort, pipeline, rows, startServer, stopServer, tempDir } from './helpers.js';
 
 async function openStalledRequest(port: number): Promise<Socket> {
     const socket = netConnect(port, '127.0.0.1');
@@ -119,4 +119,24 @@ test('clients keep syncing across a server restart', async () => {
 
     const fresh = await connect({ path: ':memory:', url: server.url });
     expect(await rows(fresh, 'SELECT x FROM t ORDER BY x')).toEqual([{ x: 1 }, { x: 2 }]);
+});
+
+test('metrics are served on their own listener', async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, 'main.db');
+    const metricsPort = await freePort();
+    const { url } = await startServer([
+        dbPath, '--auth-token', 'secret', '--backup-url', join(dir, 'backup'),
+        '--metrics-listen', `127.0.0.1:${metricsPort}`,
+    ]);
+    expect((await pipeline(url, ['CREATE TABLE t(x)', 'INSERT INTO t VALUES (1)'], 'secret')).status).toBe(200);
+    const onApiPort = await fetch(`${url}/metrics`, { headers: { authorization: 'Bearer secret' } });
+    expect(onApiPort.status).toBe(404);
+
+    const text = await (await fetch(`http://127.0.0.1:${metricsPort}/metrics`)).text();
+    const value = (name: string) => Number(text.split('\n').find(line => line.startsWith(`${name}{`))?.split(' ').at(-1));
+    expect(text).toContain('turso_sync_http_requests_total{endpoint="pipeline",status="200"} 1');
+    expect(value('turso_sync_wal_frames')).toBeGreaterThan(0);
+    expect(value('turso_sync_generation')).toBe(0);
+    expect(value('turso_sync_backup_snapshot_pending')).toBeGreaterThanOrEqual(0);
 });
