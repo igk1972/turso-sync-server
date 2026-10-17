@@ -105,7 +105,7 @@ struct Opts {
     )]
     keep_generations: usize,
     /// Checkpoint after every write request (for testing).
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, env = "TURSO_SYNC_CHECKPOINT_AFTER_WRITE")]
     checkpoint_after_write: bool,
     #[arg(
         long,
