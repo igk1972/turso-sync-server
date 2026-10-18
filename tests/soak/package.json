@@ -1,0 +1,8 @@
+{
+  "name": "turso-sync-server-soak",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@tursodatabase/sync": "0.8.3"
+  }
+}

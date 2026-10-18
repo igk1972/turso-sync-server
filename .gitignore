@@ -1,3 +1,4 @@
 /target
 /tests/js/node_modules
 .env*
+/tests/soak/node_modules
