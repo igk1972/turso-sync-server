@@ -197,7 +197,12 @@ SYNC_SERVER_FILE_DB=1 SYNC_SERVER_BACKUP=1 SYNC_SERVER_ARGS=--checkpoint-after-w
 BACKUP_S3_URL=s3://bucket/prefix AWS_ENDPOINT=… AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… npm test -- backup.test.ts
 # clients switching over from tursodb
 UPSTREAM_TURSODB=/path/to/tursodb npm test -- checkpoint.test.ts
+# crashes: at every step of a checkpoint, a backup upload and a restore,
+# then at random moments under load (10 times by default)
+CRASH_ITERATIONS=300 npm test -- crash.test.ts
 ```
+
+The crash tests stop the server at fixed points through `TURSO_SYNC_CRASH_AT=name[:n]`, which makes it kill itself the n-th time it gets there; the points are the `crash::point` calls in the source.
 
 Go tests (`tests/go`):
 

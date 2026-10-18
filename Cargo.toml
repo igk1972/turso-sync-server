@@ -13,6 +13,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.5.47", features = ["derive", "env"] }
 crc32c = "0.6.8"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+libc = "0.2.191"
 mimalloc = { version = "0.1.47", default-features = false }
 object_store = { version = "0.14.2", features = ["aws"] }
 prometheus-client = "0.25.1"

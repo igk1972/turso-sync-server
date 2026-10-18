@@ -1,3 +1,4 @@
+mod crash;
 mod generations;
 mod http;
 mod metrics;

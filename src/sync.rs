@@ -16,6 +16,7 @@ use turso_core::{
     Value as CoreValue,
 };
 
+use crate::crash;
 use crate::generations::{db_file_meta, Generations, Revision, SealedPages};
 use crate::metrics::{self, metrics, CheckpointLabels};
 use crate::replica::{self, Job, Replica, Target};
@@ -183,15 +184,18 @@ impl DbState {
         let pages: RoaringBitmap = self.conn.wal_changed_pages_after(0)?.into_iter().collect();
         let page_count = pages.len();
         generations.seal(SealedPages::Known(pages))?;
+        crash::point("checkpoint.sealed");
         // The bound makes the checkpoint fail rather than fold frames that are
         // missing from the sealed page set. A failure leaves the WAL in place,
         // which is safe: the next generation then repeats those pages.
         let result = self.conn.checkpoint(CheckpointMode::Truncate {
             upper_bound_inclusive: Some(wal.max_frame),
         });
+        crash::point("checkpoint.truncated");
         let after = self.conn.wal_state()?;
         self.checkpoint_seq = after.checkpoint_seq_no;
         generations.store_identity(after.checkpoint_seq_no, after.max_frame > 0)?;
+        crash::point("checkpoint.identity-stored");
         self.wal_salts_recorded = after.max_frame > 0;
         self.last_checkpoint = Instant::now();
         self.last_checkpoint_at = Some(SystemTime::now());

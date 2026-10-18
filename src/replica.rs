@@ -42,6 +42,7 @@ use tracing::{info, warn};
 use turso_core::types::WalState;
 use turso_core::Connection;
 
+use crate::crash;
 use crate::generations::write_atomic;
 use crate::metrics::{metrics, UploadLabels};
 
@@ -569,6 +570,9 @@ impl Replica {
     /// Records the outcome of a job from [`Replica::next_job`]. Returns whether
     /// a new snapshot became restorable.
     pub fn finish(&mut self, job: &Job, succeeded: bool, wal: &WalState) -> Result<bool> {
+        if succeeded {
+            crash::point(&format!("backup.{}-uploaded", job.kind()));
+        }
         self.busy = false;
         let labels = UploadLabels {
             db: self.db_file.display().to_string(),
@@ -928,6 +932,7 @@ pub async fn restore(
             return Err(err);
         }
     };
+    crash::point("restore.downloaded");
     let continues = (complete && at.is_none())
         .then(|| (chain.last().unwrap().as_str(), chain[0].as_str()));
     install(db_path, &tmp, continues)?;
@@ -1065,6 +1070,7 @@ fn install(db_path: &FsPath, tmp: &FsPath, continues: Option<(&str, &str)>) -> R
     if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         File::open(parent)?.sync_all()?;
     }
+    crash::point("restore.installed");
     if let Some((tip, root)) = continues {
         fs::create_dir_all(&sync_dir)?;
         write_atomic(&sync_dir.join(RESTORED_FILE), format!("{tip} {root}\n").as_bytes())?;
