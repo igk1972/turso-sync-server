@@ -1,17 +1,18 @@
 //! Prometheus metrics, served on `--metrics-listen`.
 //!
 //! Counters are updated where things happen. Database gauges are refreshed
-//! from the database state on every scrape.
+//! from the database state on every scrape, process metrics are read then too.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
+use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::EncodeLabelSet;
-use prometheus_client::metrics::counter::Counter;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric};
+use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
 
@@ -75,7 +76,9 @@ pub fn metrics() -> &'static Metrics {
 
 impl Metrics {
     fn new() -> Self {
-        let mut registry = Registry::with_prefix("turso_sync");
+        let mut root = Registry::default();
+        root.register_collector(Box::new(ProcessCollector));
+        let registry = root.sub_registry_with_prefix("turso_sync");
         let info = Family::<InfoLabels, Gauge>::default();
         info.get_or_create(&InfoLabels {
             version: env!("CARGO_PKG_VERSION"),
@@ -167,7 +170,7 @@ impl Metrics {
             metrics.backup_last_snapshot.clone(),
         );
         Self {
-            registry,
+            registry: root,
             ..metrics
         }
     }
@@ -177,6 +180,60 @@ impl Metrics {
         encode(&mut text, &self.registry).expect("writing to a String cannot fail");
         text
     }
+}
+
+/// The standard `process_*` metrics. Memory and descriptors are read from
+/// `/proc`, so they are missing outside Linux.
+#[derive(Debug)]
+struct ProcessCollector;
+
+impl Collector for ProcessCollector {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let cpu = ConstCounter::new(cpu_seconds());
+        cpu.encode(encoder.encode_descriptor(
+            "process_cpu_seconds",
+            "User and system CPU time spent",
+            None,
+            cpu.metric_type(),
+        )?)?;
+        if let Some(bytes) = resident_memory_bytes() {
+            let rss = ConstGauge::new(bytes);
+            rss.encode(encoder.encode_descriptor(
+                "process_resident_memory_bytes",
+                "Resident memory size",
+                None,
+                rss.metric_type(),
+            )?)?;
+        }
+        if let Some(count) = open_fds() {
+            let fds = ConstGauge::new(count);
+            fds.encode(encoder.encode_descriptor(
+                "process_open_fds",
+                "Open file descriptors",
+                None,
+                fds.metric_type(),
+            )?)?;
+        }
+        Ok(())
+    }
+}
+
+fn cpu_seconds() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
+fn resident_memory_bytes() -> Option<i64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: i64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as i64)
+}
+
+fn open_fds() -> Option<i64> {
+    // Reading the directory takes a descriptor of its own.
+    Some(std::fs::read_dir("/proc/self/fd").ok()?.count() as i64 - 1)
 }
 
 pub fn db(path: &str) -> DbLabels {
@@ -224,5 +281,6 @@ mod tests {
         assert!(text.contains(r#"turso_sync_http_requests_total{endpoint="pipeline",status="200"} 1"#), "{text}");
         assert!(text.contains(r#"turso_sync_wal_frames{db="/data/main.db"} 7"#), "{text}");
         assert!(text.contains("turso_sync_build_info{version="), "{text}");
+        assert!(text.contains("\nprocess_cpu_seconds_total "), "{text}");
     }
 }

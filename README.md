@@ -162,6 +162,7 @@ A restored file is a regular SQLite database and opens in `sqlite3`.
 | `turso_sync_backup_uploads_total{db,kind,result}` | Uploads (`snapshot`, `frames`; `ok`, `error`) |
 | `turso_sync_backup_uploaded_bytes_total{db,kind,result}` | Bytes uploaded after compression |
 | `turso_sync_open_databases` | Open databases |
+| `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_open_fds` | Memory, CPU time and open descriptors of the server (memory and descriptors on Linux only) |
 
 Example alerting rules:
 
