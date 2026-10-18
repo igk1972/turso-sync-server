@@ -1,7 +1,8 @@
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::header::{self, HeaderValue};
 use axum::http::{Method, StatusCode};
@@ -9,10 +10,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures_util::{stream, StreamExt};
 use tracing::{error, info};
 
 use crate::metrics::{self, metrics, EndpointLabels, RequestLabels};
-use crate::sync::{HttpResponse, TursoSyncServer};
+use crate::sync::{HttpResponse, PageBatches, TursoSyncServer};
 
 pub struct AppState {
     pub server: TursoSyncServer,
@@ -133,8 +135,34 @@ async fn dispatch(
         }
     };
 
-    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, [(header::CONTENT_TYPE, resp.content_type)], resp.body).into_response()
+    let HttpResponse {
+        status,
+        content_type,
+        body,
+        stream,
+    } = resp;
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let headers = [(header::CONTENT_TYPE, content_type)];
+    match stream {
+        None => (status, headers, body).into_response(),
+        Some(batches) => (status, headers, streamed_body(body, batches)).into_response(),
+    }
+}
+
+/// `head` followed by the batches. A channel closed before the end marker
+/// fails the body, which aborts the connection: ending it normally would
+/// hand the client a truncated page set as if it were complete.
+fn streamed_body(head: Vec<u8>, batches: PageBatches) -> Body {
+    let head = stream::once(async move { Ok(Bytes::from(head)) });
+    let rest = stream::unfold(Some(batches), |batches| async move {
+        let mut batches = batches?;
+        match batches.recv().await {
+            Some(Some(batch)) => Some((Ok(batch), Some(batches))),
+            Some(None) => None,
+            None => Some((Err(io::Error::other("page download aborted")), None)),
+        }
+    });
+    Body::from_stream(head.chain(rest))
 }
 
 fn internal_error(message: String) -> HttpResponse {
@@ -142,6 +170,7 @@ fn internal_error(message: String) -> HttpResponse {
         status: 500,
         content_type: "text/plain".to_string(),
         body: message.into_bytes(),
+        stream: None,
     }
 }
 

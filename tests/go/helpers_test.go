@@ -1,6 +1,7 @@
 package synctest
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -94,6 +95,26 @@ func (s *server) stop(t *testing.T) {
 	t.Helper()
 	require.NoError(t, s.cmd.Process.Signal(syscall.SIGTERM))
 	<-s.done
+}
+
+// sql runs a statement on the server directly, bypassing any client.
+func (s *server) sql(t *testing.T, statement string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"requests": []map[string]any{{"type": "execute", "stmt": map[string]any{"sql": statement}}},
+	})
+	require.NoError(t, err)
+	resp, err := http.Post(s.url+"/v2/pipeline", "application/json", bytes.NewReader(body))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var result struct {
+		Results []struct {
+			Type string `json:"type"`
+		} `json:"results"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	require.Equal(t, "ok", result.Results[0].Type, statement)
 }
 
 func (s *server) checkpoint(t *testing.T, path string) map[string]any {

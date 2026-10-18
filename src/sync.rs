@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -7,6 +8,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use prost::Message;
 use roaring::RoaringBitmap;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use turso_core::{
@@ -14,7 +16,7 @@ use turso_core::{
     Value as CoreValue,
 };
 
-use crate::generations::{Generations, Revision, SealedPages};
+use crate::generations::{db_file_meta, Generations, Revision, SealedPages};
 use crate::metrics::{self, metrics, CheckpointLabels};
 use crate::replica::{self, Job, Replica, Target};
 use turso_sync_engine::server_proto::{
@@ -45,6 +47,11 @@ const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 /// checkpoint in between would make that revision unreadable. Pinned reads and
 /// page-selector reads therefore hold checkpoints off for this long.
 const PINNED_READ_LEASE: Duration = Duration::from_secs(60);
+/// Page sets larger than one batch are streamed batch by batch.
+const DOWNLOAD_BATCH_PAGES: usize = 256;
+const DOWNLOAD_QUEUE_BATCHES: usize = 4;
+/// A client that stops reading a download would hold checkpoints off for good.
+const DEFAULT_DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a checkpoint waits for a backup upload running without the lock.
 const BACKUP_IDLE_WAIT: Duration = Duration::from_secs(30);
 const BACKUP_MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -112,6 +119,7 @@ struct DbState {
     last_checkpoint: Instant,
     last_checkpoint_at: Option<SystemTime>,
     replica: Option<Replica>,
+    active_downloads: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,6 +156,7 @@ impl DbState {
             return Ok(CheckpointOutcome::Skipped);
         };
         if self.pinned_until.is_some_and(|until| Instant::now() < until)
+            || self.active_downloads.load(Ordering::SeqCst) > 0
             || self.replica.as_ref().is_some_and(Replica::busy)
         {
             return Ok(CheckpointOutcome::Deferred);
@@ -304,6 +313,7 @@ enum DbSource {
 pub struct TursoSyncServer {
     source: DbSource,
     checkpoint: CheckpointConfig,
+    download_stall_timeout: Duration,
 }
 
 impl TursoSyncServer {
@@ -315,6 +325,7 @@ impl TursoSyncServer {
                 config.backup.as_ref().map(|backup| backup.target.clone()),
             )?),
             checkpoint,
+            download_stall_timeout: DEFAULT_DOWNLOAD_STALL_TIMEOUT,
         })
     }
 
@@ -337,7 +348,14 @@ impl TursoSyncServer {
                 open_handles,
             },
             checkpoint,
+            download_stall_timeout: DEFAULT_DOWNLOAD_STALL_TIMEOUT,
         })
+    }
+
+    /// How long a download waits for a client that stopped reading.
+    pub fn with_download_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.download_stall_timeout = timeout;
+        self
     }
 
     fn open_databases(&self) -> Vec<Arc<DbHandle>> {
@@ -421,6 +439,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/json".to_string(),
             body: serde_json::to_vec(&body)?,
+            stream: None,
         })
     }
 
@@ -537,6 +556,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/json".to_string(),
             body,
+            stream: None,
         })
     }
 
@@ -791,7 +811,11 @@ impl TursoSyncServer {
         }
     }
 
-    pub(crate) fn handle_pull_updates(&self, db: &DbHandle, body: &[u8]) -> Result<HttpResponse> {
+    pub(crate) fn handle_pull_updates(
+        &self,
+        db: &Arc<DbHandle>,
+        body: &[u8],
+    ) -> Result<HttpResponse> {
         let req = <PullUpdatesReqProtoBody as Message>::decode(body)
             .map_err(|e| anyhow!("Failed to decode PullUpdatesRequest: {}", e))?;
 
@@ -816,7 +840,7 @@ impl TursoSyncServer {
         {
             let mut state = db.state.lock().unwrap();
             if state.generations.is_some() {
-                return self.handle_generation_pull_updates(&mut state, &req);
+                return self.handle_generation_pull_updates(db, &mut state, &req);
             }
         }
         self.handle_page_pull_updates(db, &req, PullUpdatesApplyMode::Incremental)
@@ -826,6 +850,7 @@ impl TursoSyncServer {
     /// are read at the revision's frame from the database file and the WAL.
     fn handle_generation_pull_updates(
         &self,
+        db: &Arc<DbHandle>,
         state: &mut DbState,
         req: &PullUpdatesReqProtoBody,
     ) -> Result<HttpResponse> {
@@ -835,7 +860,8 @@ impl TursoSyncServer {
             .as_ref()
             .expect("caller checked generations");
         let (epoch, current) = (generations.epoch(), generations.current());
-        let max_frame = conn.wal_state()?.max_frame;
+        let wal = conn.wal_state()?;
+        let max_frame = wal.max_frame;
 
         let pinned = !req.server_revision.is_empty();
         let watermark = if pinned {
@@ -906,11 +932,14 @@ impl TursoSyncServer {
         }
 
         let db_size = current_snapshot_db_size_pages(&conn, watermark)?;
-        let candidates: Box<dyn Iterator<Item = u32>> = match changed {
-            Some(pages) => Box::new(pages.into_iter().filter(move |p| u64::from(*p) <= db_size)),
-            None => Box::new(1..=u32::try_from(db_size)?),
+        let pages: Vec<u32> = match changed {
+            Some(pages) => pages.into_iter().filter(|p| u64::from(*p) <= db_size).collect(),
+            None => (1..=u32::try_from(db_size)?).collect(),
         };
-        let mut response_body = Vec::new();
+        let pages: Vec<u32> = match &selector {
+            Some(selector) => pages.into_iter().filter(|p| selector.contains(p - 1)).collect(),
+            None => pages,
+        };
         let header = PullUpdatesRespProtoBody {
             server_revision: Revision::format(epoch, current, watermark),
             db_size,
@@ -921,41 +950,40 @@ impl TursoSyncServer {
             mvcc_log: None,
             protocol: PullUpdatesProtocol::Pages as i32,
         };
+        let mut response_body = Vec::new();
         encode_length_delimited(&mut response_body, &header.encode_to_vec());
-
-        let mut page = vec![0u8; PAGE_SIZE];
-        let mut sent = 0usize;
-        for page_no in candidates {
-            if selector
-                .as_ref()
-                .is_some_and(|selector| !selector.contains(page_no - 1))
-            {
-                continue;
-            }
-            if !conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
-                return Err(anyhow!(
-                    "page {page_no} is missing at frame {watermark} of generation {current}"
-                ));
-            }
-            let page_msg = PageData {
-                page_id: u64::from(page_no - 1),
-                encoded_page: Bytes::copy_from_slice(&page),
-            };
-            encode_length_delimited(&mut response_body, &page_msg.encode_to_vec());
-            sent += 1;
-        }
         if pinned || selector.is_some() {
             state.pinned_until = Some(Instant::now() + PINNED_READ_LEASE);
         }
         debug!(
-            "pull-updates: client_revision={:?} server_revision={} pages={sent} db_size={db_size}",
-            req.client_revision, header.server_revision
+            "pull-updates: client_revision={:?} server_revision={} pages={} db_size={db_size}",
+            req.client_revision,
+            header.server_revision,
+            pages.len()
         );
 
+        let stream = if pages.len() <= DOWNLOAD_BATCH_PAGES {
+            encode_pages(&conn, &pages, watermark, &mut response_body)?;
+            None
+        } else {
+            let download = PageDownload {
+                db: db.clone(),
+                pages,
+                watermark,
+                checkpoint_seq: wal.checkpoint_seq_no,
+                db_file: db_file_meta(&db.path),
+                stall_timeout: self.download_stall_timeout,
+                _active: ActiveDownload::new(&state.active_downloads),
+            };
+            let (tx, rx) = mpsc::channel(DOWNLOAD_QUEUE_BATCHES);
+            tokio::runtime::Handle::current().spawn(download.run(tx));
+            Some(rx)
+        };
         Ok(HttpResponse {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            stream,
         })
     }
 
@@ -1093,6 +1121,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            stream: None,
         })
     }
 
@@ -1220,6 +1249,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            stream: None,
         })
     }
 
@@ -1265,6 +1295,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            stream: None,
         })
     }
 
@@ -1304,6 +1335,7 @@ impl TursoSyncServer {
             status: 200,
             content_type: "application/protobuf".to_string(),
             body: response_body,
+            stream: None,
         })
     }
 
@@ -1341,6 +1373,101 @@ pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) content_type: String,
     pub(crate) body: Vec<u8>,
+    /// More of the body, sent after `body` as it is read.
+    pub(crate) stream: Option<PageBatches>,
+}
+
+/// Batches of a streamed body. `None` marks the end; a channel closed
+/// without it means the download failed, and the connection is aborted
+/// instead of ending a truncated body as if it were complete.
+pub(crate) type PageBatches = mpsc::Receiver<Option<Bytes>>;
+
+/// Holds checkpoints off while a page download is in flight.
+struct ActiveDownload(Arc<AtomicUsize>);
+
+impl ActiveDownload {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for ActiveDownload {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Sends a large page set in batches and takes the database lock per batch,
+/// so writes go on during the download. Pages are read at a fixed frame,
+/// which stays readable as long as no checkpoint runs and the WAL is not
+/// reset; a reset or a database file change aborts the download.
+struct PageDownload {
+    db: Arc<DbHandle>,
+    pages: Vec<u32>,
+    watermark: u64,
+    checkpoint_seq: u32,
+    db_file: (u64, u128),
+    stall_timeout: Duration,
+    _active: ActiveDownload,
+}
+
+impl PageDownload {
+    async fn run(self, tx: mpsc::Sender<Option<Bytes>>) {
+        let download = Arc::new(self);
+        for start in (0..download.pages.len()).step_by(DOWNLOAD_BATCH_PAGES) {
+            let reader = download.clone();
+            let batch = match tokio::task::spawn_blocking(move || reader.read_batch(start)).await {
+                Ok(Ok(batch)) => batch,
+                Ok(Err(err)) => {
+                    warn!("{}: page download aborted: {err:#}", download.db.path);
+                    return;
+                }
+                Err(err) => {
+                    error!("{}: page download failed: {err}", download.db.path);
+                    return;
+                }
+            };
+            match tokio::time::timeout(download.stall_timeout, tx.send(Some(batch))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    info!("{}: dropping a client that stopped reading a page download", download.db.path);
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(None).await;
+    }
+
+    fn read_batch(&self, start: usize) -> Result<Bytes> {
+        let end = (start + DOWNLOAD_BATCH_PAGES).min(self.pages.len());
+        let state = self.db.state.lock().unwrap();
+        if state.conn.wal_state()?.checkpoint_seq_no != self.checkpoint_seq {
+            return Err(anyhow!("the WAL was reset during the download"));
+        }
+        if db_file_meta(&self.db.path) != self.db_file {
+            return Err(anyhow!("the database file changed during the download"));
+        }
+        let mut out = Vec::with_capacity((end - start) * (PAGE_SIZE + 16));
+        encode_pages(&state.conn, &self.pages[start..end], self.watermark, &mut out)?;
+        Ok(Bytes::from(out))
+    }
+}
+
+fn encode_pages(conn: &Connection, pages: &[u32], watermark: u64, out: &mut Vec<u8>) -> Result<()> {
+    let mut page = vec![0u8; PAGE_SIZE];
+    for &page_no in pages {
+        if !conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
+            return Err(anyhow!("page {page_no} is missing at frame {watermark}"));
+        }
+        let page_msg = PageData {
+            page_id: u64::from(page_no - 1),
+            encoded_page: Bytes::copy_from_slice(&page),
+        };
+        encode_length_delimited(out, &page_msg.encode_to_vec());
+    }
+    Ok(())
 }
 
 struct MvccLogSnapshot {
@@ -1613,6 +1740,7 @@ fn text_response(status: u16, body: &str) -> HttpResponse {
         status,
         content_type: "text/plain".to_string(),
         body: body.as_bytes().to_vec(),
+        stream: None,
     }
 }
 
@@ -1730,6 +1858,7 @@ fn open_db_handle(
             pinned_until: None,
             last_checkpoint: Instant::now(),
             last_checkpoint_at: None,
+            active_downloads: Arc::new(AtomicUsize::new(0)),
             replica,
         }),
         backup_idle: Condvar::new(),

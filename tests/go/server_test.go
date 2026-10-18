@@ -98,3 +98,15 @@ func TestRestoreFromBackup(t *testing.T) {
 	reader.pull(t)
 	require.Equal(t, valuesUpTo(4), reader.values(t))
 }
+
+func TestLargeBootstrap(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "main.db")
+	s := startServer(t, 0, append([]string{dbPath}, noTimer...)...)
+	s.sql(t, "CREATE TABLE big(x INTEGER PRIMARY KEY, y BLOB)")
+	// About 16 MB, far more than one streamed batch.
+	s.sql(t, "INSERT INTO big SELECT value, randomblob(4000) FROM generate_series(1, 4000)")
+
+	c := mustConnect(t, s.url)
+	require.Equal(t, 4000, c.count(t, "SELECT COUNT(*) FROM big"))
+	require.Equal(t, 4000*4000, c.count(t, "SELECT SUM(length(y)) FROM big"))
+}

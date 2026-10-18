@@ -99,7 +99,7 @@ Every option has an environment variable; see `turso-sync-server --help` for the
 | `--sync-dir` | `TURSO_SYNC_DIR` | — | Directory with many databases |
 | `--auth-token` | `TURSO_SYNC_AUTH_TOKEN` | — | Access token |
 | `--auth-token-file` | `TURSO_SYNC_AUTH_TOKEN_FILE` | — | Read the token from a file |
-| `--request-timeout` | `TURSO_SYNC_REQUEST_TIMEOUT` | 60 s | Limit for receiving and processing a request |
+| `--request-timeout` | `TURSO_SYNC_REQUEST_TIMEOUT` | 60 s | Limit for receiving and processing a request, and for a client to keep reading a download |
 | `--checkpoint-interval` | `TURSO_SYNC_CHECKPOINT_INTERVAL` | 300 s | How often to checkpoint (0 disables) |
 | `--checkpoint-min-frames` | `TURSO_SYNC_CHECKPOINT_MIN_FRAMES` | 1000 | Skip a checkpoint while the WAL holds fewer frames |
 | `--keep-generations` | `TURSO_SYNC_KEEP_GENERATIONS` | 1000 | Generations to remember; older clients download the whole database |
@@ -116,6 +116,8 @@ Every option has an environment variable; see `turso-sync-server --help` for the
 The server notices when the WAL was reset behind its back (a `PRAGMA wal_checkpoint` from a client, or the database edited with `sqlite3` while the server was down) and sends such clients the whole database instead of silently losing changes.
 
 The server understands `tursodb` revisions, so clients switch over without downloading the database again.
+
+Large downloads, such as a client's first one, are streamed in batches of 1 MB: memory use does not depend on the database size, and writes go on during the download. Checkpoints wait until the download ends; a client that stops reading for `--request-timeout` is disconnected.
 
 ## Backups
 
@@ -175,7 +177,6 @@ time() - turso_sync_last_checkpoint_timestamp_seconds > 3600
 ## Limitations
 
 - Partial sync is not supported: it does not work against a local server with `tursodb` either.
-- The initial download of a database is assembled in memory in full, as in `tursodb`.
 - MVCC databases behave as in `tursodb`: no checkpoints and no backups.
 
 ## Development

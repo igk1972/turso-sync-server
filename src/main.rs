@@ -87,7 +87,7 @@ struct Opts {
         long,
         env = "TURSO_SYNC_REQUEST_TIMEOUT",
         default_value_t = 60,
-        help = "Seconds allowed to receive and process one request"
+        help = "Seconds allowed to receive and process one request, and to wait for a client to read on"
     )]
     request_timeout: u64,
     #[arg(
@@ -327,7 +327,8 @@ async fn main() -> Result<()> {
             TursoSyncServer::new(path, &config, checkpoint)?
         }
         (None, None) => return Err(anyhow!("a database path or --sync-dir is required")),
-    };
+    }
+    .with_download_stall_timeout(Duration::from_secs(opts.request_timeout));
     if auth_token.is_none() {
         warn!("no auth token configured: anyone who can reach the server can read and write");
     }

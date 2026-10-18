@@ -132,7 +132,7 @@ pub fn read_wal_header(db_path: &str) -> Option<(u32, u32, u32)> {
     Some((word(12), word(16), word(20)))
 }
 
-fn db_file_meta(db_path: &str) -> (u64, u128) {
+pub(crate) fn db_file_meta(db_path: &str) -> (u64, u128) {
     match fs::metadata(db_path) {
         Ok(meta) => {
             let mtime = meta
