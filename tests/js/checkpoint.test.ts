@@ -118,7 +118,7 @@ test('periodic checkpoints run on their own', async () => {
 
 test.skipIf(!process.env.UPSTREAM_TURSODB)('clients of tursodb keep syncing after switching servers', async () => {
     const dbPath = join(tempDir(), 'main.db');
-    let server = await startServer([dbPath], undefined, process.env.UPSTREAM_TURSODB);
+    let server = await startServer([dbPath], undefined, { binary: process.env.UPSTREAM_TURSODB });
     const { writer, reader } = await syncedPair(server.url);
     await insert(writer, 2);
     await stopServer(server);

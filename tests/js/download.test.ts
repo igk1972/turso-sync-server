@@ -4,17 +4,9 @@ import { request, type IncomingMessage } from 'node:http';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { connect } from '@tursodatabase/sync';
-import { NO_TIMER, checkpoint, pipeline, rows, startServer, tempDir } from './helpers.js';
+import { NO_TIMER, checkpoint, rows, sql, startServer, tempDir } from './helpers.js';
 
 const ROW_BYTES = 4000;
-
-async function sql(url: string, statement: string): Promise<any[][]> {
-    const resp = await pipeline(url, [statement]);
-    expect(resp.status).toBe(200);
-    const result = (await resp.json()).results[0];
-    if (result.type !== 'ok') throw new Error(`${statement}: ${JSON.stringify(result)}`);
-    return result.response.result.rows;
-}
 
 /** Rows of about a page each, inserted in parts to stay within short request timeouts. */
 async function seed(url: string, count: number) {

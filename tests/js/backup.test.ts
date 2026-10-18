@@ -1,67 +1,16 @@
-import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { expect, test } from 'vitest';
 import { connect } from '@tursodatabase/sync';
 import {
-    BINARY, NO_TIMER, checkpoint, insert, pipeline, range, startServer, stopServer, syncedPair,
-    tempDir, values, waitFor,
+    NO_TIMER, backedUpFrames, checkpoint, cli, generations, insert, pipeline, range, removeDatabase,
+    sqliteValues, startServer, stopServer, syncedPair, tempDir, values, waitFor, walFrames,
 } from './helpers.js';
 
 // S3-compatible storage to run the restore tests against as well, e.g.
 // s3://bucket/prefix, configured through the AWS_* variables.
 const S3_URL = process.env.BACKUP_S3_URL;
-
-const WAL_HEADER_SIZE = 32;
-const WAL_FRAME_SIZE = 24 + 4096;
-
-function cli(...args: string[]): string {
-    return execFileSync(BINARY, args, { encoding: 'utf8' });
-}
-
-function removeDatabase(dbPath: string) {
-    for (const suffix of ['', '-wal', '-shm']) rmSync(`${dbPath}${suffix}`, { force: true });
-    rmSync(`${dbPath}-sync`, { recursive: true, force: true });
-}
-
-function sqliteValues(dbPath: string): number[] {
-    const db = new DatabaseSync(dbPath);
-    try {
-        expect(db.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
-        return db.prepare('SELECT x FROM t ORDER BY x').all().map((row: any) => row.x);
-    } finally {
-        db.close();
-    }
-}
-
-/** Generations listed by the `backups` command, oldest first. */
-function generations(backupUrl: string): { id: string, frames: number, base: string }[] {
-    return cli('backups', '--backup-url', backupUrl)
-        .trim()
-        .split('\n')
-        .slice(1)
-        .map(line => {
-            const [id, , , frames, ...base] = line.split(/\s+/);
-            return { id, frames: Number(frames), base: base.join(' ') };
-        });
-}
-
-function walFrames(dbPath: string): number {
-    const wal = `${dbPath}-wal`;
-    return existsSync(wal) ? Math.max(0, (statSync(wal).size - WAL_HEADER_SIZE) / WAL_FRAME_SIZE) : 0;
-}
-
-/** The last frame uploaded for the newest generation of a directory backup. */
-function backedUpFrames(backupDir: string): number {
-    const root = join(backupDir, 'generations');
-    if (!existsSync(root)) return 0;
-    const newest = readdirSync(root).sort().at(-1);
-    const frames = newest ? join(root, newest, 'frames') : '';
-    if (!newest || !existsSync(frames)) return 0;
-    return Math.max(0, ...readdirSync(frames).map(name => Number(name.split(/[-.]/)[1])));
-}
 
 const targets = [
     { name: 'a directory', url: (dir: string) => join(dir, 'backup') },
