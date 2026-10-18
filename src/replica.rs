@@ -361,10 +361,23 @@ impl Replica {
         let sync_dir = PathBuf::from(format!("{db_path}-sync"));
         let state_path = sync_dir.join(STATE_FILE);
         let restored_path = sync_dir.join(RESTORED_FILE);
-        let state = match fs::read_to_string(&state_path) {
-            Ok(text) => State::decode(&text)
-                .with_context(|| format!("malformed {}", state_path.display()))?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        let loaded = match fs::read_to_string(&state_path) {
+            Ok(text) => match State::decode(&text) {
+                Ok(state) => Some(state),
+                Err(err) => {
+                    warn!(
+                        "{db_path}: unreadable {} ({err}); the backup starts over from a snapshot",
+                        state_path.display()
+                    );
+                    None
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        let state = match loaded {
+            Some(state) => state,
+            None => {
                 let mut state = State {
                     epoch,
                     generation,
@@ -385,7 +398,6 @@ impl Replica {
                 }
                 state
             }
-            Err(err) => return Err(err.into()),
         };
         let mut replica = Self {
             target,
@@ -416,6 +428,16 @@ impl Replica {
 
     fn persist(&self) -> Result<()> {
         write_atomic(&self.state_path, self.state.encode().as_bytes())
+    }
+
+    /// Records upload progress without syncing it to disk. Runs every backup
+    /// tick under the database lock, where an fsync would stall requests, and
+    /// a progress record lost in a power failure only repeats some uploads.
+    fn persist_progress(&self) -> Result<()> {
+        let tmp = self.state_path.with_extension("tmp");
+        fs::write(&tmp, self.state.encode())?;
+        fs::rename(&tmp, &self.state_path)?;
+        Ok(())
     }
 
     /// Committed frames of the current WAL that the backup lacks.
@@ -575,13 +597,15 @@ impl Replica {
                 self.state.snapshot_at = Utc::now().timestamp();
             }
             Job::Upload { meta, segment, .. } => {
-                if meta.is_some() {
-                    self.state.established = true;
-                    snapshotted = self.state.meta == Some(Meta::Snapshot);
-                }
                 if let Some(segment) = segment {
                     self.state.shipped = self.state.shipped.max(segment.last);
                 }
+                if meta.is_none() {
+                    self.persist_progress()?;
+                    return Ok(false);
+                }
+                self.state.established = true;
+                snapshotted = self.state.meta == Some(Meta::Snapshot);
             }
         }
         self.persist()?;
@@ -1201,6 +1225,21 @@ mod tests {
             bytes.extend_from_slice(frame);
         }
         bytes
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_state_file_starts_the_backup_over() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = Target::open(dir.path().join("backup").to_str().unwrap()).unwrap();
+        let db = dir.path().join("db").to_string_lossy().to_string();
+        fs::create_dir_all(format!("{db}-sync")).unwrap();
+        fs::write(format!("{db}-sync/{STATE_FILE}"), b"epoch 1\ngener").unwrap();
+
+        let replica = Replica::open(target, &db, 7, 3, Duration::from_secs(3600)).unwrap();
+        assert!(replica.snapshot_pending());
+        assert_eq!((replica.state.epoch, replica.state.generation), (7, 3));
+        let stored = fs::read_to_string(format!("{db}-sync/{STATE_FILE}")).unwrap();
+        assert_eq!(State::decode(&stored).unwrap(), replica.state);
     }
 
     #[tokio::test]
