@@ -102,6 +102,48 @@ test('a chunked bootstrap holds checkpoints off', async () => {
     expect(await checkpoint(url)).toEqual({ status: 'deferred' });
 });
 
+test('chunked bootstraps hold a checkpoint off no longer than --checkpoint-max-delay', async () => {
+    const dbPath = join(tempDir(), 'main.db');
+    const { url } = await startServer([dbPath, ...NO_TIMER, '--checkpoint-max-delay', '1']);
+
+    const seed = await connect({ path: ':memory:', url });
+    await seed.exec('CREATE TABLE big(x INTEGER PRIMARY KEY, y BLOB)');
+    await seed.exec('INSERT INTO big SELECT value, randomblob(1024) FROM generate_series(1, 50)');
+    await seed.push();
+
+    const chunked = await connect({ path: ':memory:', url, pullBytesThreshold: 8192 });
+    expect(await checkpoint(url)).toEqual({ status: 'deferred' });
+    await new Promise(r => setTimeout(r, 1100));
+    expect(await checkpoint(url)).toMatchObject({ status: 'done' });
+
+    await seed.exec('INSERT INTO big VALUES (51, randomblob(1024))');
+    await seed.push();
+    await chunked.pull();
+    const late = await connect({ path: ':memory:', url, pullBytesThreshold: 8192 });
+    for (const db of [chunked, late]) {
+        expect(await rows(db, 'SELECT COUNT(*) AS c FROM big')).toEqual([{ c: 51 }]);
+    }
+});
+
+test('a chunked bootstrap cut off by a checkpoint fails with 410 and can start over', async () => {
+    const dbPath = join(tempDir(), 'main.db');
+    const { url } = await startServer([dbPath, ...NO_TIMER, '--checkpoint-max-delay', '0']);
+    const seed = await connect({ path: ':memory:', url });
+    await seed.exec('CREATE TABLE big(x INTEGER PRIMARY KEY, y BLOB)');
+    await seed.exec('INSERT INTO big SELECT value, randomblob(1024) FROM generate_series(1, 3000)');
+    await seed.push();
+
+    const bootstrap = connect({ path: ':memory:', url, pullBytesThreshold: 8192 });
+    await new Promise(r => setTimeout(r, 30));
+    await seed.exec('INSERT INTO big VALUES (3001, randomblob(1024))');
+    await seed.push();
+    expect(await checkpoint(url)).toMatchObject({ status: 'done' });
+    await expect(bootstrap).rejects.toThrow(/status=410/);
+
+    const retried = await connect({ path: ':memory:', url, pullBytesThreshold: 8192 });
+    expect(await rows(retried, 'SELECT COUNT(*) AS c FROM big')).toEqual([{ c: 3001 }]);
+});
+
 test('periodic checkpoints run on their own', async () => {
     const dbPath = join(tempDir(), 'main.db');
     const { url } = await startServer([

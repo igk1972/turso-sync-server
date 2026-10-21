@@ -102,6 +102,7 @@ Every option has an environment variable; see `turso-sync-server --help` for the
 | `--request-timeout` | `TURSO_SYNC_REQUEST_TIMEOUT` | 60 s | Limit for receiving and processing a request, and for a client to keep reading a download |
 | `--checkpoint-interval` | `TURSO_SYNC_CHECKPOINT_INTERVAL` | 300 s | How often to checkpoint (0 disables) |
 | `--checkpoint-min-frames` | `TURSO_SYNC_CHECKPOINT_MIN_FRAMES` | 1000 | Skip a checkpoint while the WAL holds fewer frames |
+| `--checkpoint-max-delay` | `TURSO_SYNC_CHECKPOINT_MAX_DELAY` | 300 s | How long downloads may hold a checkpoint off |
 | `--keep-generations` | `TURSO_SYNC_KEEP_GENERATIONS` | 1000 | Generations to remember; older clients download the whole database |
 | `--backup-url` | `TURSO_SYNC_BACKUP_URL` | — | `s3://bucket/prefix` or a directory for backups |
 | `--backup-interval` | `TURSO_SYNC_BACKUP_INTERVAL` | 1 s | How often to upload new WAL frames |
@@ -117,7 +118,7 @@ The server notices when the WAL was reset behind its back (a `PRAGMA wal_checkpo
 
 The server understands `tursodb` revisions, so clients switch over without downloading the database again.
 
-Large downloads, such as a client's first one, are streamed in batches of 1 MB: memory use does not depend on the database size, and writes go on during the download. Checkpoints wait until the download ends; a client that stops reading for `--request-timeout` is disconnected.
+Large downloads, such as a client's first one, are streamed in batches of 1 MB: memory use does not depend on the database size, and writes go on during the download. Checkpoints wait until the download ends; a client that stops reading for `--request-timeout` is disconnected. A first download split into parts (`pullBytesThreshold` in the JS client) holds checkpoints off for a minute after each part, so frequent ones would hold them off forever: after `--checkpoint-max-delay` the checkpoint goes ahead, and the downloads in progress fail (`connect()` rejects with status 410) and have to start over. Applications using `pullBytesThreshold` should retry `connect()`.
 
 ## Backups
 

@@ -107,6 +107,13 @@ struct Opts {
     checkpoint_min_frames: u64,
     #[arg(
         long,
+        env = "TURSO_SYNC_CHECKPOINT_MAX_DELAY",
+        default_value_t = 300,
+        help = "Seconds chunked downloads may hold a checkpoint off; past that they start over"
+    )]
+    checkpoint_max_delay: u64,
+    #[arg(
+        long,
         env = "TURSO_SYNC_KEEP_GENERATIONS",
         default_value_t = 1000,
         help = "Checkpoint generations to remember; older clients download the whole database"
@@ -246,6 +253,7 @@ impl Opts {
             interval: (self.checkpoint_interval > 0)
                 .then(|| Duration::from_secs(self.checkpoint_interval)),
             min_frames: self.checkpoint_min_frames,
+            max_delay: Duration::from_secs(self.checkpoint_max_delay),
             after_write: self.checkpoint_after_write,
         }
     }

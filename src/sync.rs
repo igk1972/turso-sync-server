@@ -72,6 +72,9 @@ pub struct OpenConfig {
 pub struct CheckpointConfig {
     pub interval: Option<Duration>,
     pub min_frames: u64,
+    /// How long chunked downloads may hold a checkpoint off; past it the
+    /// checkpoint goes ahead and those downloads start over.
+    pub max_delay: Duration,
     pub after_write: bool,
 }
 
@@ -117,6 +120,7 @@ struct DbState {
     checkpoint_seq: u32,
     wal_salts_recorded: bool,
     pinned_until: Option<Instant>,
+    held_since: Option<Instant>,
     last_checkpoint: Instant,
     last_checkpoint_at: Option<SystemTime>,
     replica: Option<Replica>,
@@ -135,8 +139,13 @@ pub(crate) enum CheckpointOutcome {
 }
 
 impl DbState {
-    fn checkpoint(&mut self, path: &str, min_frames: u64) -> Result<CheckpointOutcome> {
-        let result = self.try_checkpoint(path, min_frames);
+    fn checkpoint(
+        &mut self,
+        path: &str,
+        min_frames: u64,
+        max_delay: Duration,
+    ) -> Result<CheckpointOutcome> {
+        let result = self.try_checkpoint(path, min_frames, max_delay);
         let outcome = match &result {
             Ok(CheckpointOutcome::Done { .. }) => "done",
             Ok(CheckpointOutcome::Deferred) => "deferred",
@@ -152,14 +161,26 @@ impl DbState {
     }
 
     /// Seals the current generation and truncates the WAL.
-    fn try_checkpoint(&mut self, path: &str, min_frames: u64) -> Result<CheckpointOutcome> {
+    fn try_checkpoint(
+        &mut self,
+        path: &str,
+        min_frames: u64,
+        max_delay: Duration,
+    ) -> Result<CheckpointOutcome> {
         let Some(generations) = self.generations.as_mut() else {
             return Ok(CheckpointOutcome::Skipped);
         };
-        if self.pinned_until.is_some_and(|until| Instant::now() < until)
-            || self.active_downloads.load(Ordering::SeqCst) > 0
-            || self.replica.as_ref().is_some_and(Replica::busy)
-        {
+        let held = self.pinned_until.is_some_and(|until| Instant::now() < until)
+            || self.active_downloads.load(Ordering::SeqCst) > 0;
+        if !held {
+            self.held_since = None;
+        } else {
+            let since = *self.held_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < max_delay {
+                return Ok(CheckpointOutcome::Deferred);
+            }
+        }
+        if self.replica.as_ref().is_some_and(Replica::busy) {
             return Ok(CheckpointOutcome::Deferred);
         }
         let wal = self.conn.wal_state()?;
@@ -181,6 +202,12 @@ impl DbState {
             }
             None => false,
         };
+        if held {
+            info!(
+                "{path}: checkpoint held off by downloads for {}s, going ahead; they start over",
+                self.held_since.map_or(0, |since| since.elapsed().as_secs())
+            );
+        }
         let pages: RoaringBitmap = self.conn.wal_changed_pages_after(0)?.into_iter().collect();
         let page_count = pages.len();
         generations.seal(SealedPages::Known(pages))?;
@@ -198,6 +225,7 @@ impl DbState {
         crash::point("checkpoint.identity-stored");
         self.wal_salts_recorded = after.max_frame > 0;
         self.last_checkpoint = Instant::now();
+        self.held_since = None;
         self.last_checkpoint_at = Some(SystemTime::now());
         if let Some(replica) = self.replica.as_mut() {
             replica.on_checkpoint(generations.epoch(), generations.current(), backed_up)?;
@@ -236,7 +264,7 @@ impl DbState {
             self.wal_salts_recorded = true;
         }
         if config.after_write {
-            self.checkpoint(path, 1)?;
+            self.checkpoint(path, 1, config.max_delay)?;
         }
         Ok(())
     }
@@ -382,7 +410,7 @@ impl TursoSyncServer {
                 continue;
             }
             let mut state = handle.lock_idle();
-            if let Err(err) = state.checkpoint(&handle.path, self.checkpoint.min_frames) {
+            if let Err(err) = state.checkpoint(&handle.path, self.checkpoint.min_frames, self.checkpoint.max_delay) {
                 error!("{}: checkpoint failed: {err}", handle.path);
             }
         }
@@ -424,7 +452,7 @@ impl TursoSyncServer {
     }
 
     pub(crate) fn handle_checkpoint(&self, db: &DbHandle) -> Result<HttpResponse> {
-        let outcome = db.lock_idle().checkpoint(&db.path, 1)?;
+        let outcome = db.lock_idle().checkpoint(&db.path, 1, self.checkpoint.max_delay)?;
         let body = match outcome {
             CheckpointOutcome::Done {
                 generation,
@@ -1860,6 +1888,7 @@ fn open_db_handle(
             checkpoint_seq: wal.checkpoint_seq_no,
             wal_salts_recorded: wal.max_frame > 0,
             pinned_until: None,
+            held_since: None,
             last_checkpoint: Instant::now(),
             last_checkpoint_at: None,
             active_downloads: Arc::new(AtomicUsize::new(0)),
@@ -2042,6 +2071,7 @@ mod tests {
             CheckpointConfig {
                 interval: None,
                 min_frames: 1,
+                max_delay: Duration::from_secs(300),
                 after_write: false,
             },
         )
