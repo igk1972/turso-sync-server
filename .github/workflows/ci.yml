@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # The same Rust as in the Dockerfile, so new lints arrive with an update of both.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99'
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tests/js/package-lock.json
+      - name: JS tests
+        working-directory: tests/js
+        run: npm ci && npm test
+      - name: JS sync tests on a file database with checkpoints after every write and backups
+        working-directory: tests/js
+        env:
+          SYNC_SERVER_FILE_DB: 1
+          SYNC_SERVER_BACKUP: 1
+          SYNC_SERVER_ARGS: --checkpoint-after-write
+        run: npm test -- sync.test.ts
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tests/go/go.mod
+          cache-dependency-path: tests/go/go.sum
+      - name: Go tests
+        working-directory: tests/go
+        run: go test -count=1 ./... && ./upstream.sh
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
