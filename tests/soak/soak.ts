@@ -186,13 +186,27 @@ function client(name: string, extra: Record<string, unknown> = {}): Promise<Db> 
     return connect({ path: ':memory:', url: SYNC_URL, authToken: TOKEN, clientName: name, ...extra });
 }
 
+/**
+ * The 0.8.3 binding keeps about 2 KB for every prepare() until the client is
+ * closed (tursodatabase/turso#9487), so long-lived clients reuse statements.
+ */
+const statements = new WeakMap<Db, Map<string, Awaited<ReturnType<Db['prepare']>>>>();
+
+async function query(db: Db, sql: string): Promise<any[]> {
+    let cached = statements.get(db);
+    if (!cached) statements.set(db, cached = new Map());
+    let stmt = cached.get(sql);
+    if (!stmt) cached.set(sql, stmt = await db.prepare(sql));
+    return stmt.all();
+}
+
 async function values(db: Db): Promise<number[]> {
-    return (await (await db.prepare('SELECT x FROM t ORDER BY x')).all()).map((row: any) => row.x);
+    return (await query(db, 'SELECT x FROM t ORDER BY x')).map((row: any) => row.x);
 }
 
 async function digest(db: Db): Promise<string> {
     const hash = createHash('sha256');
-    for (const row of await (await db.prepare('SELECT x, y FROM t ORDER BY x')).all()) {
+    for (const row of await query(db, 'SELECT x, y FROM t ORDER BY x')) {
         hash.update(`${row.x}:${row.y};`);
     }
     return hash.digest('hex');
