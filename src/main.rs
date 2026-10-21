@@ -139,7 +139,7 @@ struct Opts {
     #[arg(
         long,
         env = "TURSO_SYNC_BACKUP_SNAPSHOT_INTERVAL",
-        default_value_t = 86400,
+        default_value_t = 21600,
         help = "Seconds between full snapshots (0 takes one at every checkpoint)"
     )]
     backup_snapshot_interval: u64,

@@ -106,7 +106,7 @@ Every option has an environment variable; see `turso-sync-server --help` for the
 | `--keep-generations` | `TURSO_SYNC_KEEP_GENERATIONS` | 1000 | Generations to remember; older clients download the whole database |
 | `--backup-url` | `TURSO_SYNC_BACKUP_URL` | — | `s3://bucket/prefix` or a directory for backups |
 | `--backup-interval` | `TURSO_SYNC_BACKUP_INTERVAL` | 1 s | How often to upload new WAL frames |
-| `--backup-snapshot-interval` | `TURSO_SYNC_BACKUP_SNAPSHOT_INTERVAL` | 86400 s | How often to take a full snapshot (0: at every checkpoint) |
+| `--backup-snapshot-interval` | `TURSO_SYNC_BACKUP_SNAPSHOT_INTERVAL` | 21600 s | How often to take a full snapshot (0: at every checkpoint) |
 | `--backup-retention-days` | `TURSO_SYNC_BACKUP_RETENTION_DAYS` | 0 | Days of history to keep (0 keeps everything) |
 | `--metrics-listen` | `TURSO_SYNC_METRICS_LISTEN` | — | Address for `/metrics` |
 
@@ -129,6 +129,7 @@ With `--backup-url` the server backs up every generation into a directory of its
 - **S3 access** uses the standard variables `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT` (for storage not run by AWS) and `AWS_ALLOW_HTTP=true` (for `http://`). The `object_store` library supports IAM roles as well, but the server has not been tested with them.
 - **One prefix holds one database, written by one server.** Under `--sync-dir` every database gets its own prefix, `{url}/{name}`.
 - **Cost:** a database under constant writes makes one S3 request per second. With many active databases, raise `--backup-interval`.
+- **Restore time** grows with the generations since the last snapshot, so `--backup-snapshot-interval` bounds it. Once a generation ends, the server merges its frames into a few large objects, which a restore downloads instead of the per-second uploads; the uploads stay for restores to a point in time. This doubles the storage taken by WAL frames.
 - **MVCC databases are not backed up.**
 
 ### Restore
@@ -160,7 +161,7 @@ A restored file is a regular SQLite database and opens in `sqlite3`.
 | `turso_sync_backup_snapshot_pending{db}` | 1 while the backup waits for a snapshot |
 | `turso_sync_backup_synced_timestamp_seconds{db}` | When the backup last held every change |
 | `turso_sync_backup_last_snapshot_timestamp_seconds{db}` | Time of the last snapshot |
-| `turso_sync_backup_uploads_total{db,kind,result}` | Uploads (`snapshot`, `frames`; `ok`, `error`) |
+| `turso_sync_backup_uploads_total{db,kind,result}` | Uploads (`snapshot`, `frames`, `merged`; `ok`, `error`) |
 | `turso_sync_backup_uploaded_bytes_total{db,kind,result}` | Bytes uploaded after compression |
 | `turso_sync_open_databases` | Open databases |
 | `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_open_fds` | Memory, CPU time and open descriptors of the server (memory and descriptors on Linux only) |

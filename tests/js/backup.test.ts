@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { connect } from '@tursodatabase/sync';
@@ -100,6 +100,36 @@ test('restore --at returns the database as it was at that time', async () => {
     expect(() => cli('restore', '--backup-url', backupDir, latest)).toThrow(/--force/);
     expect(() => cli('restore', '--backup-url', join(dir, 'nothing'), join(dir, 'none.db')))
         .toThrow(/holds no backup/);
+});
+
+test('a finished generation is merged into one object that restores alone', async () => {
+    const dir = tempDir();
+    const dbPath = join(dir, 'main.db');
+    const backupDir = join(dir, 'backup');
+    const server = await startServer([dbPath, ...NO_TIMER, '--backup-url', backupDir]);
+    const { writer } = await syncedPair(server.url);
+    let middle = new Date();
+    for (const x of range(2, 5)) {
+        await insert(writer, x);
+        await waitFor(() => backedUpFrames(backupDir) >= walFrames(dbPath), 5000);
+        if (x === 3) middle = new Date();
+    }
+    const [first] = generations(backupDir);
+    const framesDir = join(backupDir, 'generations', first.id, 'frames');
+    const uploads = readdirSync(framesDir);
+    expect(uploads.length).toBeGreaterThan(1);
+    expect(await checkpoint(server.url)).toMatchObject({ status: 'done' });
+    const merged = `${String(1).padStart(12, '0')}-${String(first.frames).padStart(12, '0')}.zst`;
+    await waitFor(() => readdirSync(framesDir).includes(merged), 5000);
+    await stopServer(server);
+
+    const past = join(dir, 'past.db');
+    cli('restore', '--backup-url', backupDir, '--at', middle.toISOString(), past);
+    expect(sqliteValues(past)).toEqual([1, 2, 3]);
+    for (const name of uploads) rmSync(join(framesDir, name));
+    const latest = join(dir, 'latest.db');
+    cli('restore', '--backup-url', backupDir, latest);
+    expect(sqliteValues(latest)).toEqual(range(1, 5));
 });
 
 test('a WAL reset by a request makes the backup start over from a snapshot', async () => {

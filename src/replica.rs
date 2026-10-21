@@ -22,7 +22,7 @@
 //! snapshot interval.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
@@ -349,6 +349,8 @@ pub struct Replica {
     snapshot_interval: Duration,
     /// When the backup last held every committed frame.
     synced_at: Option<SystemTime>,
+    /// Generations that ended since [`Replica::take_finished`] last ran.
+    finished: Vec<String>,
 }
 
 impl Replica {
@@ -408,6 +410,7 @@ impl Replica {
             busy: false,
             snapshot_interval,
             synced_at: None,
+            finished: Vec::new(),
         };
         replica.align(epoch, generation, None);
         replica.persist()?;
@@ -454,6 +457,11 @@ impl Replica {
             Some(_) => self.state.meta.is_none(),
             None => self.state.parent.is_none(),
         }
+    }
+
+    /// Generations that will get no more uploads, for [`compact`].
+    pub fn take_finished(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.finished)
     }
 
     pub fn synced_at(&self) -> Option<SystemTime> {
@@ -651,6 +659,7 @@ impl Replica {
 
     /// Moves on to the next local generation after a checkpoint.
     pub fn on_checkpoint(&mut self, epoch: u32, generation: u64, backed_up: bool) -> Result<()> {
+        self.finished.extend(self.state.id.clone());
         let parent = if backed_up { self.state.id.take() } else { None };
         self.state = State {
             epoch,
@@ -847,6 +856,101 @@ pub struct Restored {
     pub complete: bool,
 }
 
+/// Merges the frame objects of a finished generation into objects of up to
+/// [`MAX_SEGMENT_FRAMES`] frames. Frames are uploaded about every second, so
+/// a generation consists of hundreds of objects, and a restore through a day
+/// of generations would download tens of thousands of them. A restore takes
+/// the merged objects and skips the ones they cover; the originals stay for
+/// restores to a point in time, which select objects by upload time. Returns
+/// the number of merged objects uploaded.
+pub async fn compact(target: &Target, db: &str, id: &str) -> Result<usize> {
+    let mut runs: Vec<Vec<SegmentObject>> = Vec::new();
+    let mut next = 1;
+    for segment in target.segments(id, None).await? {
+        if segment.last < next {
+            continue;
+        }
+        if segment.first > next {
+            break;
+        }
+        next = segment.last + 1;
+        match runs.last_mut() {
+            Some(run) if segment.last - run[0].first < MAX_SEGMENT_FRAMES => run.push(segment),
+            _ => runs.push(vec![segment]),
+        }
+    }
+    let mut merged = 0;
+    for run in runs.into_iter().filter(|run| run.len() > 1) {
+        let locations: Vec<Path> = run.into_iter().map(|segment| segment.location).collect();
+        let parts: Vec<Vec<u8>> = futures_util::stream::iter(locations)
+            .map(|location| {
+                let store = target.store.clone();
+                async move {
+                    let compressed = store.get(&location).await?.bytes().await?;
+                    anyhow::Ok(zstd::decode_all(&compressed[..])?)
+                }
+            })
+            .buffered(PARALLEL_DOWNLOADS)
+            .try_collect()
+            .await?;
+        let (first, last, bytes) = merge_segments(&parts)
+            .with_context(|| format!("failed to merge the frames of backup generation {id}"))?;
+        let body = compress(&bytes)?;
+        let size = body.len();
+        let location = target
+            .generation(id)
+            .join("frames")
+            .join(segment_name(first, last).as_str());
+        let result = target.store.put(&location, body.into()).await;
+        let labels = UploadLabels {
+            db: db.to_string(),
+            kind: "merged",
+            result: if result.is_ok() { "ok" } else { "error" },
+        };
+        metrics().backup_uploads.get_or_create(&labels).inc();
+        result?;
+        metrics().backup_uploaded_bytes.get_or_create(&labels).inc_by(size as u64);
+        merged += 1;
+    }
+    Ok(merged)
+}
+
+/// Joins consecutive, possibly overlapping segments into one. Returns its
+/// first and last frame and its bytes.
+fn merge_segments(parts: &[Vec<u8>]) -> Result<(u64, u64, Vec<u8>)> {
+    let mut merged = Vec::new();
+    let (mut first, mut next, mut page_size) = (0, 0, 0);
+    for part in parts {
+        if part.len() < SEGMENT_HEADER_SIZE || &part[..8] != SEGMENT_MAGIC {
+            bail!("not a WAL segment");
+        }
+        let size = u32::from_be_bytes(part[8..12].try_into()?);
+        let start = u64::from_be_bytes(part[12..20].try_into()?);
+        let count = u64::from(u32::from_be_bytes(part[20..24].try_into()?));
+        let frame_size = WAL_FRAME_HEADER_SIZE + size as usize;
+        if part.len() - SEGMENT_HEADER_SIZE != count as usize * frame_size {
+            bail!("segment {start} is truncated");
+        }
+        if merged.is_empty() {
+            (first, next, page_size) = (start, start, size);
+            merged.extend_from_slice(&part[..SEGMENT_HEADER_SIZE]);
+        } else if size != page_size {
+            bail!("page size {size} differs from {page_size}");
+        } else if start > next {
+            bail!("frames {next}..{} are missing", start - 1);
+        }
+        let skip = (next - start).min(count) as usize;
+        merged.extend_from_slice(&part[SEGMENT_HEADER_SIZE + skip * frame_size..]);
+        next = next.max(start + count);
+    }
+    if merged.is_empty() {
+        bail!("nothing to merge");
+    }
+    let count = u32::try_from(next - first)?;
+    merged[20..24].copy_from_slice(&count.to_be_bytes());
+    Ok((first, next - 1, merged))
+}
+
 /// Restores the newest backup generation, or the newest one at `at`, into
 /// `db_path`, replacing the database and its WAL. Returns `None` when the
 /// backup is empty.
@@ -946,12 +1050,18 @@ pub async fn restore(
 /// Generations to replay, oldest (the snapshot) first.
 async fn restore_chain(target: &Target, at: Option<DateTime<Utc>>) -> Result<Option<Vec<String>>> {
     let ids = target.list_ids().await?;
+    let mut metas = MetaCache {
+        target,
+        ids: &ids,
+        unread: ids.len(),
+        known: HashMap::new(),
+    };
     let candidates = ids
         .iter()
         .rev()
         .filter(|id| at.is_none_or(|at| id_time(id).is_some_and(|time| time <= at)));
     for tip in candidates {
-        let Some(mut meta) = target.meta(tip).await? else {
+        let Some(mut meta) = metas.get(tip).await? else {
             continue;
         };
         let mut chain = vec![tip.clone()];
@@ -959,7 +1069,7 @@ async fn restore_chain(target: &Target, at: Option<DateTime<Utc>>) -> Result<Opt
             if chain.len() > ids.len() {
                 bail!("backup generation {tip} has a cyclic history");
             }
-            meta = target.meta(&parent).await?.ok_or_else(|| {
+            meta = metas.get(&parent).await?.ok_or_else(|| {
                 anyhow!("backup generation {parent}, which {tip} builds on, is missing")
             })?;
             chain.push(parent);
@@ -968,6 +1078,35 @@ async fn restore_chain(target: &Target, at: Option<DateTime<Utc>>) -> Result<Opt
         return Ok(Some(chain));
     }
     Ok(None)
+}
+
+/// Reads metas newest first, a batch at a time: a chain walks back through
+/// hundreds of generations, and one request per step adds up to minutes.
+struct MetaCache<'a> {
+    target: &'a Target,
+    ids: &'a [String],
+    /// `ids[..unread]` have not been fetched yet.
+    unread: usize,
+    known: HashMap<String, Option<Meta>>,
+}
+
+impl MetaCache<'_> {
+    async fn get(&mut self, id: &str) -> Result<Option<Meta>> {
+        while !self.known.contains_key(id) && self.unread > 0 {
+            let batch = &self.ids[self.unread.saturating_sub(PARALLEL_DOWNLOADS)..self.unread];
+            let metas: Vec<Option<Meta>> = futures_util::stream::iter(batch)
+                .map(|id| self.target.meta(id))
+                .buffered(PARALLEL_DOWNLOADS)
+                .try_collect()
+                .await?;
+            self.known.extend(batch.iter().cloned().zip(metas));
+            self.unread -= batch.len();
+        }
+        match self.known.get(id) {
+            Some(meta) => Ok(meta.clone()),
+            None => self.target.meta(id).await,
+        }
+    }
 }
 
 async fn download_snapshot(target: &Target, id: &str, file: &File) -> Result<()> {
@@ -1231,6 +1370,18 @@ mod tests {
             bytes.extend_from_slice(frame);
         }
         bytes
+    }
+
+    #[test]
+    fn merges_overlapping_segments_and_refuses_gaps() {
+        let frames: Vec<Vec<u8>> = (1..=5).map(|n| frame(n, n, n as u8, 512)).collect();
+        let parts = [segment(1, &frames[..3], 512), segment(2, &frames[1..], 512)];
+        let (first, last, merged) = merge_segments(&parts).unwrap();
+        assert_eq!((first, last), (1, 5));
+        assert_eq!(merged, segment(1, &frames, 512));
+
+        let parts = [segment(1, &frames[..2], 512), segment(4, &frames[3..], 512)];
+        assert!(merge_segments(&parts).is_err());
     }
 
     #[tokio::test]

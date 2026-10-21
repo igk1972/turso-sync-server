@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
@@ -1911,6 +1911,7 @@ async fn back_up(handle: Arc<DbHandle>, target: Arc<Target>, config: BackupConfi
     let mut ticker = tokio::time::interval(config.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut backoff = Duration::ZERO;
+    let mut finished = VecDeque::new();
     loop {
         ticker.tick().await;
         tokio::time::sleep(backoff).await;
@@ -1919,6 +1920,22 @@ async fn back_up(handle: Arc<DbHandle>, target: Arc<Target>, config: BackupConfi
                 if !backoff.is_zero() {
                     info!("{}: backup uploads to {target} work again", handle.path);
                     backoff = Duration::ZERO;
+                }
+                let db = handle.clone();
+                finished.extend(
+                    tokio::task::spawn_blocking(move || {
+                        db.state.lock().unwrap().replica.as_mut().map(Replica::take_finished)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                );
+                // One generation per tick keeps new frames from waiting long.
+                if let Some(id) = finished.pop_front() {
+                    if let Err(err) = replica::compact(&target, &handle.path, &id).await {
+                        warn!("{}: failed to merge backup generation {id}: {err:#}", handle.path);
+                    }
                 }
                 if let (true, Some(retention)) = (snapshotted, config.retention) {
                     match replica::prune(&target, retention).await {
