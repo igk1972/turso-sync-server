@@ -216,7 +216,7 @@ go test ./...                                         # this server's tests
 TURSO_SYNC_CHECKPOINT_AFTER_WRITE=true ./upstream.sh  # the same with a checkpoint after every write
 ```
 
-Soak test (`tests/soak`): a pod meant to run for days with the server, Caddy in front of it, a load client and Prometheus. Writers, readers and fresh clients work through Caddy; every half hour writes pause and all clients must pull to the same state, and every three hours the backup is restored from S3 and checked against the acknowledged writes. Inconsistencies are counted in `soak_violations_total` and logged as `VIOLATION`.
+Soak test (`tests/soak`): a pod meant to run for days with the server, Caddy in front of it, a load client on Bun and Prometheus. Writers, readers and fresh clients work through Caddy; every half hour writes pause and all clients must pull to the same state, and every three hours the backup is restored from S3 and checked against the acknowledged writes. Inconsistencies are counted in `soak_violations_total` and logged as `VIOLATION`.
 
 ```sh
 tests/soak/deploy.sh   # builds the images and recreates the pod, keeping its data

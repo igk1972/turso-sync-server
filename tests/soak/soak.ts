@@ -426,7 +426,8 @@ createServer((_, res) => {
     res.end(exposition());
 }).listen(METRICS_PORT, '127.0.0.1');
 
-log(`soak on ${SYNC_URL}: ${WRITERS} writers, ${READERS} readers, backup ${BACKUP_URL ?? 'not checked'}`);
+const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`;
+log(`soak (${runtime}) on ${SYNC_URL}: ${WRITERS} writers, ${READERS} readers, backup ${BACKUP_URL ?? 'not checked'}`);
 await retry('init', async () => {
     const db = await client('init');
     await db.exec('CREATE TABLE IF NOT EXISTS t(x INTEGER PRIMARY KEY, y TEXT)');
