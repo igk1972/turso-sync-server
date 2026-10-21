@@ -224,6 +224,13 @@ tests/soak/deploy.sh   # builds the images and recreates the pod, keeping its da
 
 The script reads `.env.podman` (the host that builds the server image) and `.env.scaleway` (the host that runs the pod, and the S3 keys) from the repository root. On that host Prometheus listens on `127.0.0.1:19090` and Caddy on `127.0.0.1:18000`; reach them through an SSH tunnel.
 
+Load test (`tests/soak/load.ts`): starts the server with `--sync-dir` on a temporary directory, runs writers and readers against many databases from several processes, and prints throughput, latencies, the server's memory and CPU, and whether every acknowledged write reached the server. Settings are `LOAD_*` variables (databases, writers and readers per database, intervals, duration, processes, server arguments):
+
+```sh
+cd tests/soak && bun install
+LOAD_DBS=100 LOAD_PROCESSES=6 bun load.ts
+```
+
 Tests on Linux in containers (`--format docker` keeps the `HEALTHCHECK`):
 
 ```sh
