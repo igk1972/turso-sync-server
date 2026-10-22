@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use futures_util::stream::FuturesOrdered;
 use futures_util::{StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
@@ -55,6 +56,8 @@ const MAX_SEGMENT_FRAMES: u64 = 4096;
 const ZSTD_LEVEL: i32 = 3;
 const SNAPSHOT_PART_SIZE: usize = 8 * 1024 * 1024;
 const PARALLEL_DOWNLOADS: usize = 32;
+/// Compressed bytes a restore downloads ahead of the frames it replays.
+const RESTORE_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
 const ID_TIME_FORMAT: &str = "%Y%m%dT%H%M%S%3f";
 /// Uploads made for a checkpoint run under the database lock.
 const INLINE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -205,6 +208,7 @@ impl Target {
                     last,
                     location: object.location,
                     uploaded: object.last_modified,
+                    size: object.size,
                 })
             })
             .collect();
@@ -237,6 +241,7 @@ struct SegmentObject {
     last: u64,
     location: Path,
     uploaded: DateTime<Utc>,
+    size: u64,
 }
 
 fn segment_name(first: u64, last: u64) -> String {
@@ -1070,28 +1075,44 @@ pub async fn restore(
                     break 'chain;
                 }
                 next = segment.last + 1;
-                plan.push((index, segment.location));
+                plan.push((index, segment));
             }
         }
 
         download_snapshot(target, &chain[0], &applier.file).await?;
         applier.read_page_size()?;
-        let mut downloads = futures_util::stream::iter(plan)
-            .map(|(index, location)| async move {
-                let compressed = target.store.get(&location).await?.bytes().await?;
-                anyhow::Ok((index, location, compressed))
-            })
-            .buffered(PARALLEL_DOWNLOADS);
+        // Merged objects take megabytes each, so the read-ahead is bounded by
+        // bytes as well as by count.
+        let mut plan = plan.into_iter().peekable();
+        let mut downloads = FuturesOrdered::new();
+        let mut in_flight = 0;
         let mut generation = None;
-        while let Some(download) = downloads.next().await {
-            let (index, location, compressed) = download?;
+        loop {
+            while let Some((_, segment)) = plan.peek() {
+                if downloads.len() >= PARALLEL_DOWNLOADS
+                    || (!downloads.is_empty() && in_flight + segment.size > RESTORE_BUFFER_BYTES)
+                {
+                    break;
+                }
+                let (index, segment) = plan.next().unwrap();
+                in_flight += segment.size;
+                downloads.push_back(async move {
+                    let compressed = target.store.get(&segment.location).await?.bytes().await?;
+                    anyhow::Ok((index, segment, compressed))
+                });
+            }
+            let Some(download) = downloads.next().await else {
+                break;
+            };
+            let (index, segment, compressed) = download?;
             if generation != Some(index) {
                 applier.start_generation();
                 generation = Some(index);
             }
             applier
-                .apply(&zstd::decode_all(&compressed[..])?)
-                .with_context(|| format!("corrupt backup object {location}"))?;
+                .apply(zstd::stream::read::Decoder::with_buffer(&compressed[..])?)
+                .with_context(|| format!("corrupt backup object {}", segment.location))?;
+            in_flight -= segment.size;
         }
         applier.file.sync_all()?;
         anyhow::Ok(complete)
@@ -1217,24 +1238,25 @@ impl Applier {
         self.pending.clear();
     }
 
-    fn apply(&mut self, segment: &[u8]) -> Result<()> {
-        if segment.len() < SEGMENT_HEADER_SIZE || &segment[..8] != SEGMENT_MAGIC {
+    fn apply(&mut self, mut segment: impl Read) -> Result<()> {
+        let mut header = [0u8; SEGMENT_HEADER_SIZE];
+        if segment.read_exact(&mut header).is_err() || &header[..8] != SEGMENT_MAGIC {
             bail!("not a WAL segment");
         }
-        let page_size = u32::from_be_bytes(segment[8..12].try_into()?);
-        let first = u64::from_be_bytes(segment[12..20].try_into()?);
-        let count = u32::from_be_bytes(segment[20..24].try_into()?) as usize;
+        let page_size = u32::from_be_bytes(header[8..12].try_into()?);
+        let first = u64::from_be_bytes(header[12..20].try_into()?);
+        let count = u64::from(u32::from_be_bytes(header[20..24].try_into()?));
         if self.page_size == 0 {
             self.page_size = page_size;
         } else if self.page_size != page_size {
             bail!("page size {page_size} differs from the database's {}", self.page_size);
         }
-        let frame_size = WAL_FRAME_HEADER_SIZE + page_size as usize;
-        let frames = &segment[SEGMENT_HEADER_SIZE..];
-        if frames.len() != count * frame_size {
-            bail!("expected {count} frames of {frame_size} bytes, got {} bytes", frames.len());
-        }
-        for (frame_no, frame) in (first..).zip(frames.chunks_exact(frame_size)) {
+        for frame_no in first..first + count {
+            let mut frame = [0u8; WAL_FRAME_HEADER_SIZE];
+            let mut page = vec![0u8; page_size as usize];
+            if segment.read_exact(&mut frame).and_then(|_| segment.read_exact(&mut page)).is_err() {
+                bail!("expected {count} frames of {page_size}-byte pages, got {}", frame_no - first);
+            }
             if frame_no < self.next_frame {
                 continue;
             }
@@ -1243,7 +1265,7 @@ impl Applier {
             if page_no == 0 {
                 bail!("frame {frame_no} has no page number");
             }
-            self.pending.push((page_no, frame[WAL_FRAME_HEADER_SIZE..].to_vec()));
+            self.pending.push((page_no, page));
             self.next_frame = frame_no + 1;
             if db_size != 0 {
                 let page_size = u64::from(self.page_size);
@@ -1253,6 +1275,9 @@ impl Applier {
                 self.file.set_len(u64::from(db_size) * page_size)?;
             }
             self.frames += 1;
+        }
+        if segment.read(&mut [0u8])? != 0 {
+            bail!("segment {first} holds more than the {count} frames it declares");
         }
         Ok(())
     }
@@ -1548,11 +1573,11 @@ mod tests {
         applier.read_page_size().unwrap();
         applier.start_generation();
         applier
-            .apply(&segment(1, &[frame(1, 0, 1, 512), frame(2, 2, 2, 512), frame(1, 0, 3, 512)], 512))
+            .apply(&segment(1, &[frame(1, 0, 1, 512), frame(2, 2, 2, 512), frame(1, 0, 3, 512)], 512)[..])
             .unwrap();
         // Frame 3 overlaps the next segment, frame 4 commits a shrink to one page.
         applier
-            .apply(&segment(3, &[frame(1, 0, 3, 512), frame(1, 1, 4, 512), frame(2, 0, 9, 512)], 512))
+            .apply(&segment(3, &[frame(1, 0, 3, 512), frame(1, 1, 4, 512), frame(2, 0, 9, 512)], 512)[..])
             .unwrap();
         applier.start_generation();
         let bytes = fs::read(&path).unwrap();
@@ -1560,7 +1585,10 @@ mod tests {
         assert!(bytes.iter().all(|b| *b == 4));
         assert_eq!(applier.next_frame, 1);
         assert!(applier
-            .apply(&segment(1, &[frame(1, 1, 0, 1024)], 1024))
+            .apply(&segment(1, &[frame(1, 1, 0, 1024)], 1024)[..])
             .is_err());
+        let whole = segment(5, &[frame(1, 0, 5, 512)], 512);
+        assert!(applier.apply(&whole[..whole.len() - 1]).is_err());
+        assert!(applier.apply(&[&whole[..], &[0]].concat()[..]).is_err());
     }
 }
