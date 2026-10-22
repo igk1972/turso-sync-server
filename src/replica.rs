@@ -36,7 +36,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, PutPayloadMut, WriteMultipart};
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 use turso_core::types::WalState;
@@ -893,7 +893,8 @@ pub struct Restored {
 /// of generations would download tens of thousands of them. A restore takes
 /// the merged objects and skips the ones they cover; the originals stay for
 /// restores to a point in time, which select objects by upload time. Returns
-/// the number of merged objects uploaded.
+/// the number of merged objects uploaded. Objects are merged one at a time as
+/// they arrive, so memory holds the compressed result rather than the frames.
 pub async fn compact(target: &Target, db: &str, id: &str) -> Result<usize> {
     let mut runs: Vec<Vec<SegmentObject>> = Vec::new();
     let mut next = 1;
@@ -912,27 +913,28 @@ pub async fn compact(target: &Target, db: &str, id: &str) -> Result<usize> {
     }
     let mut merged = 0;
     for run in runs.into_iter().filter(|run| run.len() > 1) {
-        let locations: Vec<Path> = run.into_iter().map(|segment| segment.location).collect();
-        let parts: Vec<Vec<u8>> = futures_util::stream::iter(locations)
-            .map(|location| {
+        let (first, last) = (run[0].first, run[run.len() - 1].last);
+        let mut downloads = futures_util::stream::iter(run)
+            .map(|segment| {
                 let store = target.store.clone();
-                async move {
-                    let compressed = store.get(&location).await?.bytes().await?;
-                    anyhow::Ok(zstd::decode_all(&compressed[..])?)
-                }
+                async move { anyhow::Ok(store.get(&segment.location).await?.bytes().await?) }
             })
-            .buffered(PARALLEL_DOWNLOADS)
-            .try_collect()
-            .await?;
-        let (first, last, bytes) = merge_segments(&parts)
+            .buffered(PARALLEL_DOWNLOADS);
+        let mut merger = SegmentMerger::new(first, last)?;
+        while let Some(compressed) = downloads.next().await {
+            merger
+                .append(&compressed?)
+                .with_context(|| format!("failed to merge the frames of backup generation {id}"))?;
+        }
+        let body = merger
+            .finish()
             .with_context(|| format!("failed to merge the frames of backup generation {id}"))?;
-        let body = compress(&bytes)?;
-        let size = body.len();
+        let size = body.content_length();
         let location = target
             .generation(id)
             .join("frames")
             .join(segment_name(first, last).as_str());
-        let result = target.store.put(&location, body.into()).await;
+        let result = target.store.put(&location, body).await;
         let labels = UploadLabels {
             db: db.to_string(),
             kind: "merged",
@@ -946,40 +948,75 @@ pub async fn compact(target: &Target, db: &str, id: &str) -> Result<usize> {
     Ok(merged)
 }
 
-/// Joins consecutive, possibly overlapping segments into one. Returns its
-/// first and last frame and its bytes.
-fn merge_segments(parts: &[Vec<u8>]) -> Result<(u64, u64, Vec<u8>)> {
-    let mut merged = Vec::new();
-    let (mut first, mut next, mut page_size) = (0, 0, 0);
-    for part in parts {
-        if part.len() < SEGMENT_HEADER_SIZE || &part[..8] != SEGMENT_MAGIC {
+/// Joins consecutive, possibly overlapping segments covering frames
+/// `first..=last` into one compressed segment, reading each part as a stream.
+struct SegmentMerger {
+    encoder: zstd::Encoder<'static, Payload>,
+    first: u64,
+    last: u64,
+    next: u64,
+    page_size: u32,
+}
+
+impl SegmentMerger {
+    fn new(first: u64, last: u64) -> Result<Self> {
+        let mut encoder = zstd::Encoder::new(Payload(PutPayloadMut::new()), ZSTD_LEVEL)?;
+        encoder.include_checksum(true)?;
+        Ok(Self { encoder, first, last, next: first, page_size: 0 })
+    }
+
+    fn append(&mut self, compressed: &[u8]) -> Result<()> {
+        let mut part = zstd::stream::read::Decoder::with_buffer(compressed)?;
+        let mut header = [0u8; SEGMENT_HEADER_SIZE];
+        if part.read_exact(&mut header).is_err() || &header[..8] != SEGMENT_MAGIC {
             bail!("not a WAL segment");
         }
-        let size = u32::from_be_bytes(part[8..12].try_into()?);
-        let start = u64::from_be_bytes(part[12..20].try_into()?);
-        let count = u64::from(u32::from_be_bytes(part[20..24].try_into()?));
-        let frame_size = WAL_FRAME_HEADER_SIZE + size as usize;
-        if part.len() - SEGMENT_HEADER_SIZE != count as usize * frame_size {
-            bail!("segment {start} is truncated");
+        let size = u32::from_be_bytes(header[8..12].try_into()?);
+        let start = u64::from_be_bytes(header[12..20].try_into()?);
+        let count = u64::from(u32::from_be_bytes(header[20..24].try_into()?));
+        if self.page_size == 0 {
+            if start != self.first {
+                bail!("the first segment starts at frame {start}, not {}", self.first);
+            }
+            self.page_size = size;
+            header[20..24].copy_from_slice(&u32::try_from(self.last - self.first + 1)?.to_be_bytes());
+            self.encoder.write_all(&header)?;
+        } else if size != self.page_size {
+            bail!("page size {size} differs from {}", self.page_size);
+        } else if start > self.next {
+            bail!("frames {}..{} are missing", self.next, start - 1);
         }
-        if merged.is_empty() {
-            (first, next, page_size) = (start, start, size);
-            merged.extend_from_slice(&part[..SEGMENT_HEADER_SIZE]);
-        } else if size != page_size {
-            bail!("page size {size} differs from {page_size}");
-        } else if start > next {
-            bail!("frames {next}..{} are missing", start - 1);
+        let frame_size = (WAL_FRAME_HEADER_SIZE + size as usize) as u64;
+        let skip = (self.next - start).min(count);
+        let skipped = std::io::copy(&mut (&mut part).take(skip * frame_size), &mut std::io::sink())?;
+        let kept = std::io::copy(&mut (&mut part).take((count - skip) * frame_size), &mut self.encoder)?;
+        if skipped + kept != count * frame_size || part.read(&mut [0u8])? != 0 {
+            bail!("segment {start} does not hold the {count} frames it declares");
         }
-        let skip = (next - start).min(count) as usize;
-        merged.extend_from_slice(&part[SEGMENT_HEADER_SIZE + skip * frame_size..]);
-        next = next.max(start + count);
+        self.next = self.next.max(start + count);
+        Ok(())
     }
-    if merged.is_empty() {
-        bail!("nothing to merge");
+
+    fn finish(self) -> Result<PutPayload> {
+        if self.next != self.last + 1 {
+            bail!("the segments end at frame {}, not {}", self.next - 1, self.last);
+        }
+        Ok(self.encoder.finish()?.0.freeze())
     }
-    let count = u32::try_from(next - first)?;
-    merged[20..24].copy_from_slice(&count.to_be_bytes());
-    Ok((first, next - 1, merged))
+}
+
+/// Collects an upload body in blocks instead of one growing buffer.
+struct Payload(PutPayloadMut);
+
+impl Write for Payload {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Restores the newest backup generation, or the newest one at `at`, into
@@ -1345,6 +1382,7 @@ pub async fn prune(target: &Target, retention: Duration) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn ids_sort_by_time() {
@@ -1403,16 +1441,36 @@ mod tests {
         bytes
     }
 
+    fn merge(first: u64, last: u64, parts: &[&[u8]]) -> Result<Vec<u8>> {
+        let mut merger = SegmentMerger::new(first, last)?;
+        for part in parts {
+            merger.append(&compress(part)?)?;
+        }
+        let body: Bytes = merger.finish()?.into();
+        Ok(zstd::decode_all(&body[..])?)
+    }
+
     #[test]
     fn merges_overlapping_segments_and_refuses_gaps() {
         let frames: Vec<Vec<u8>> = (1..=5).map(|n| frame(n, n, n as u8, 512)).collect();
-        let parts = [segment(1, &frames[..3], 512), segment(2, &frames[1..], 512)];
-        let (first, last, merged) = merge_segments(&parts).unwrap();
-        assert_eq!((first, last), (1, 5));
-        assert_eq!(merged, segment(1, &frames, 512));
+        let parts: [&[u8]; 2] = [&segment(1, &frames[..3], 512), &segment(2, &frames[1..], 512)];
+        assert_eq!(merge(1, 5, &parts).unwrap(), segment(1, &frames, 512));
+        let covered: [&[u8]; 2] = [&segment(1, &frames, 512), &segment(2, &frames[1..3], 512)];
+        assert_eq!(merge(1, 5, &covered).unwrap(), segment(1, &frames, 512));
 
-        let parts = [segment(1, &frames[..2], 512), segment(4, &frames[3..], 512)];
-        assert!(merge_segments(&parts).is_err());
+        let parts: [&[u8]; 2] = [&segment(1, &frames[..2], 512), &segment(4, &frames[3..], 512)];
+        assert!(merge(1, 5, &parts).is_err());
+    }
+
+    #[test]
+    fn refuses_segments_that_do_not_match_their_frames() {
+        let frames: Vec<Vec<u8>> = (1..=4).map(|n| frame(n, n, n as u8, 512)).collect();
+        let whole = segment(1, &frames, 512);
+        assert!(merge(1, 4, &[&whole[..whole.len() - 1]]).is_err());
+        assert!(merge(1, 4, &[&[&whole[..], &[0]].concat()]).is_err());
+        assert!(merge(1, 3, &[&whole]).is_err());
+        assert!(merge(2, 4, &[&whole]).is_err());
+        assert!(merge(1, 4, &[&segment(1, &frames[..2], 512), &segment(3, &frames[2..], 1024)]).is_err());
     }
 
     #[tokio::test]
