@@ -1912,6 +1912,7 @@ async fn back_up(handle: Arc<DbHandle>, target: Arc<Target>, config: BackupConfi
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut backoff = Duration::ZERO;
     let mut finished = VecDeque::new();
+    let mut pruning: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         ticker.tick().await;
         tokio::time::sleep(backoff).await;
@@ -1937,13 +1938,10 @@ async fn back_up(handle: Arc<DbHandle>, target: Arc<Target>, config: BackupConfi
                         warn!("{}: failed to merge backup generation {id}: {err:#}", handle.path);
                     }
                 }
+                // Removing a day of history takes minutes on S3, too long to hold back new frames.
                 if let (true, Some(retention)) = (snapshotted, config.retention) {
-                    match replica::prune(&target, retention).await {
-                        Ok(0) => {}
-                        Ok(removed) => {
-                            info!("{}: removed {removed} expired backup generations", handle.path)
-                        }
-                        Err(err) => warn!("{}: failed to prune the backup: {err:#}", handle.path),
+                    if pruning.as_ref().is_none_or(|task| task.is_finished()) {
+                        pruning = Some(tokio::spawn(prune(handle.path.clone(), target.clone(), retention)));
                     }
                 }
             }
@@ -1954,6 +1952,14 @@ async fn back_up(handle: Arc<DbHandle>, target: Arc<Target>, config: BackupConfi
                 backoff = (backoff * 2).clamp(Duration::from_secs(1), BACKUP_MAX_BACKOFF);
             }
         }
+    }
+}
+
+async fn prune(db: String, target: Arc<Target>, retention: Duration) {
+    match replica::prune(&target, retention).await {
+        Ok(0) => {}
+        Ok(removed) => info!("{db}: removed {removed} expired backup generations"),
+        Err(err) => warn!("{db}: failed to prune the backup: {err:#}"),
     }
 }
 
@@ -2031,6 +2037,7 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replica::Meta;
     use std::path::Path;
 
     #[test]
@@ -2075,6 +2082,10 @@ mod tests {
     const TEST_MAX_OPEN: usize = 4;
 
     fn dir_server(base: &Path) -> TursoSyncServer {
+        backed_up_dir_server(base, None)
+    }
+
+    fn backed_up_dir_server(base: &Path, backup: Option<BackupConfig>) -> TursoSyncServer {
         TursoSyncServer::new_dir(
             base.to_path_buf(),
             OpenConfig {
@@ -2083,7 +2094,7 @@ mod tests {
                 db_opts: DatabaseOpts::new(),
                 max_open: TEST_MAX_OPEN,
                 keep_generations: 16,
-                backup: None,
+                backup,
             },
             CheckpointConfig {
                 interval: None,
@@ -2142,5 +2153,52 @@ mod tests {
             !outside.path().join("data").exists(),
             "a refused name must not create files outside the served tree"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pruning_does_not_hold_back_uploads() {
+        let base = tempfile::TempDir::new().unwrap();
+        let target = Target::slow_deletes(Duration::from_secs(3600));
+        // An existing database keeps the expired generations from being restored.
+        assert!(dir_server(base.path()).resolve_db(Some("db")).is_ok(), "the database must open");
+        let expired = target.child("db").add_old_generation(40, Meta::Snapshot).await;
+        target.child("db").add_old_generation(35, Meta::Snapshot).await;
+        let server = backed_up_dir_server(
+            base.path(),
+            Some(BackupConfig {
+                target: target.clone(),
+                interval: Duration::from_millis(20),
+                snapshot_interval: Duration::from_secs(3600),
+                retention: Some(Duration::from_secs(30 * 24 * 3600)),
+            }),
+        );
+        let db = tokio::task::spawn_blocking(move || server.resolve_db(Some("db")).ok())
+            .await
+            .unwrap()
+            .expect("the database must open");
+        let synced_since = |since: SystemTime| {
+            let db = db.clone();
+            async move {
+                for _ in 0..250 {
+                    let synced = db.state.lock().unwrap().replica.as_ref().unwrap().synced_at();
+                    if synced.is_some_and(|at| at >= since) {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                false
+            }
+        };
+
+        let started = SystemTime::now();
+        db.state.lock().unwrap().conn.execute("CREATE TABLE t(x)").unwrap();
+        assert!(synced_since(started).await, "the first snapshot must be uploaded");
+        // The snapshot started a prune that is now stuck deleting the expired generation.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let written = SystemTime::now();
+        db.state.lock().unwrap().conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(synced_since(written).await, "new frames must not wait for the prune");
+        assert!(target.child("db").has_generation(&expired).await);
     }
 }

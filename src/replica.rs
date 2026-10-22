@@ -122,6 +122,35 @@ impl Target {
         })
     }
 
+    /// An in-memory backup whose deletes each take `delete_wait`.
+    #[cfg(test)]
+    pub(crate) fn slow_deletes(delete_wait: Duration) -> Arc<Self> {
+        use object_store::memory::InMemory;
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let config = ThrottleConfig { wait_delete_per_call: delete_wait, ..Default::default() };
+        Arc::new(Self {
+            store: Arc::new(ThrottledStore::new(InMemory::new(), config)),
+            root: Path::default(),
+            url: "memory://".to_string(),
+            runtime: Handle::current(),
+            local_dir: None,
+        })
+    }
+
+    /// Adds an empty generation from `days` ago and returns its id.
+    #[cfg(test)]
+    pub(crate) async fn add_old_generation(&self, days: i64, meta: Meta) -> String {
+        let time = Utc::now() - TimeDelta::days(days);
+        let id = format!("{}Z-00000001-{days}", time.format(ID_TIME_FORMAT));
+        self.store.put(&self.generation(&id).join("meta"), meta.encode().into()).await.unwrap();
+        id
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_generation(&self, id: &str) -> bool {
+        self.list_ids().await.unwrap().iter().any(|known| known == id)
+    }
+
     pub fn runtime(&self) -> &Handle {
         &self.runtime
     }
@@ -184,10 +213,12 @@ impl Target {
     }
 
     async fn remove_generation(&self, id: &str) -> Result<()> {
-        let mut objects = self.store.list(Some(&self.generation(id)));
-        while let Some(object) = objects.next().await {
-            match self.store.delete(&object?.location).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+        let locations = self.store.list(Some(&self.generation(id))).map_ok(|object| object.location);
+        // S3 deletes up to 1000 objects per request this way.
+        let mut deleted = self.store.delete_stream(locations.boxed());
+        while let Some(result) = deleted.next().await {
+            match result {
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(err) => return Err(err.into()),
             }
         }
@@ -1427,6 +1458,22 @@ mod tests {
         target.remove_generation(&p0).await.unwrap();
         assert_eq!(prune(&target, Duration::from_secs(30 * 24 * 3600)).await.unwrap(), 2);
         assert_eq!(target.list_ids().await.unwrap(), vec![s35, p34, s1]);
+    }
+
+    #[tokio::test]
+    async fn removes_every_object_of_a_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = Target::open(dir.path().to_str().unwrap()).unwrap();
+        for id in ["a", "b"] {
+            target.store.put(&target.generation(id).join("meta"), Meta::Snapshot.encode().into()).await.unwrap();
+            for n in 0..1500 {
+                let location = target.generation(id).join("frames").join(format!("{n:08}"));
+                target.store.put(&location, vec![0u8; 8].into()).await.unwrap();
+            }
+        }
+        target.remove_generation("a").await.unwrap();
+        assert_eq!(target.list_ids().await.unwrap(), vec!["b".to_string()]);
+        assert_eq!(target.store.list(Some(&target.generation("b"))).count().await, 1501);
     }
 
     #[test]
