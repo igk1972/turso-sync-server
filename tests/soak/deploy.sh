@@ -17,7 +17,7 @@ target build --tag localhost/turso-soak-go:latest --build-arg SERVER_IMAGE="$ser
 target build --tag localhost/turso-soak:latest --build-arg SERVER_IMAGE="$server_image" "$root/tests/soak"
 target build --tag localhost/turso-soak-prometheus:latest \
     --file "$root/tests/soak/prometheus.Dockerfile" "$root/tests/soak"
-target pull docker.io/library/caddy:2.11.7 docker.io/rustfs/rustfs:1.0.1 docker.io/amazon/aws-cli:2.37.10
+target pull docker.io/library/caddy:2.11.7 docker.io/rustfs/rustfs:1.0.3-glibc docker.io/amazon/aws-cli:2.37.10
 
 # The server uploads the rest of the WAL on shutdown.
 target pod stop --ignore --time 30 "$pod" >/dev/null
@@ -49,7 +49,12 @@ run() { target run --detach --pod "$pod" --restart always --log-opt max-size=20m
 run --name "$pod-s3" --memory 512m --volume turso-soak-s3:/data \
     --secret turso-soak-s3-key,type=env,target=RUSTFS_ACCESS_KEY \
     --secret turso-soak-s3-secret,type=env,target=RUSTFS_SECRET_KEY \
-    docker.io/rustfs/rustfs:1.0.1
+    --env RUSTFS_OVERRIDE_CPU_CORES=2 --env RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=32 \
+    --env RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=10 --env RUSTFS_RUNTIME_FSYNC_BLOCKING_THREADS=1 \
+    --env RUSTFS_SCANNER_ENABLED=false --env RUSTFS_HEAL_ENABLED=false \
+    --env RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS=10 --env RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS=1 \
+    --env RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=256 --env RUSTFS_CONSOLE_ENABLE=false \
+    docker.io/rustfs/rustfs:1.0.3-glibc
 target run --rm --pod "$pod" "${keys[@]}" --entrypoint sh docker.io/amazon/aws-cli:2.37.10 -c "
     for _ in \$(seq 60); do
         aws --endpoint-url \"\$AWS_ENDPOINT\" s3api head-bucket --bucket $bucket 2>/dev/null && exit
