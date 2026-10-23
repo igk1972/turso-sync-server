@@ -34,7 +34,7 @@ for volume in turso-soak-data turso-soak-prometheus turso-soak-s3; do
 done
 
 # Limits keep the soak from starving the other services on the host.
-target pod create --name "$pod" --cpus 2 --memory 2g \
+target pod create --name "$pod" --cpus 2 --memory 3g \
     --publish 127.0.0.1:19090:9090 --publish 127.0.0.1:18000:8000 >/dev/null
 
 keys=(
@@ -58,7 +58,7 @@ target run --rm --pod "$pod" "${keys[@]}" --entrypoint sh docker.io/amazon/aws-c
     done
     exit 1"
 
-run --name "$pod-server" --memory 256m --stop-timeout 30 --volume turso-soak-data:/data "${access[@]}" \
+run --name "$pod-server" --memory 512m --stop-timeout 30 --volume turso-soak-data:/data "${access[@]}" \
     --env RUST_LOG=warn,turso_sync_server=info,turso_sync_server::http=warn \
     --env TURSO_SYNC_LISTEN=127.0.0.1:8080 \
     --env TURSO_SYNC_METRICS_LISTEN=127.0.0.1:9464 \
