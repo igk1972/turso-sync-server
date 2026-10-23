@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the images and recreates the soak pod on the podman host from
 # .env.podman. The database, the Prometheus data and the backup are kept
-# across deploys. The backup goes to RustFS inside the pod.
+# across deploys. The backup goes to Garage inside the pod.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -17,51 +17,44 @@ target build --tag localhost/turso-soak-go:latest --build-arg SERVER_IMAGE="$ser
 target build --tag localhost/turso-soak:latest --build-arg SERVER_IMAGE="$server_image" "$root/tests/soak"
 target build --tag localhost/turso-soak-prometheus:latest \
     --file "$root/tests/soak/prometheus.Dockerfile" "$root/tests/soak"
-target pull docker.io/library/caddy:2.11.7 docker.io/rustfs/rustfs:1.0.3-glibc docker.io/amazon/aws-cli:2.37.10
+target build --tag localhost/turso-soak-garage:latest --file "$root/tests/soak/garage.Dockerfile" "$root/tests/soak"
+target pull docker.io/library/caddy:2.11.7
 
 # The server uploads the rest of the WAL on shutdown.
 target pod stop --ignore --time 30 "$pod" >/dev/null
 target pod rm --force --ignore "$pod" >/dev/null
-# RustFS keeps its data across deploys, so its keys must stay the same.
-for name in turso-soak-s3-key turso-soak-s3-secret; do
-    target secret inspect "$name" >/dev/null 2>&1 ||
-        openssl rand -hex 20 | tr -d '\n' | target secret create "$name" - >/dev/null
-done
+# Garage keeps its data across deploys, so its keys must stay the same.
+secret_once() {
+    target secret inspect "$1" >/dev/null 2>&1 || printf %s "$2" | target secret create "$1" - >/dev/null
+}
+secret_once turso-soak-garage-key "GK$(openssl rand -hex 16)"
+secret_once turso-soak-garage-secret "$(openssl rand -hex 32)"
+secret_once turso-soak-garage-rpc "$(openssl rand -hex 32)"
 # The server and its clients are recreated together, so a new token is fine.
 openssl rand -hex 32 | tr -d '\n' | target secret create --replace turso-soak-token - >/dev/null
-for volume in turso-soak-data turso-soak-prometheus turso-soak-s3; do
+for volume in turso-soak-data turso-soak-prometheus turso-soak-garage; do
     target volume create --ignore "$volume" >/dev/null
 done
 
 # Limits keep the soak from starving the other services on the host.
-target pod create --name "$pod" --cpus 2 --memory 3g \
+target pod create --name "$pod" --cpus 2 --memory 4g \
     --publish 127.0.0.1:19090:9090 --publish 127.0.0.1:18000:8000 >/dev/null
 
 keys=(
-    --secret turso-soak-s3-key,type=env,target=AWS_ACCESS_KEY_ID
-    --secret turso-soak-s3-secret,type=env,target=AWS_SECRET_ACCESS_KEY
-    --env AWS_REGION=us-east-1 --env AWS_ENDPOINT=http://127.0.0.1:9000 --env AWS_ALLOW_HTTP=true
+    --secret turso-soak-garage-key,type=env,target=AWS_ACCESS_KEY_ID
+    --secret turso-soak-garage-secret,type=env,target=AWS_SECRET_ACCESS_KEY
+    --env AWS_REGION=garage --env AWS_ENDPOINT=http://127.0.0.1:3900 --env AWS_ALLOW_HTTP=true
 )
 # Only the server and the clients get the keys and the token.
 access=("${keys[@]}" --secret turso-soak-token,type=env,target=TURSO_SYNC_AUTH_TOKEN)
 run() { target run --detach --pod "$pod" --restart always --log-opt max-size=20m "$@" >/dev/null; }
 
-run --name "$pod-s3" --memory 512m --volume turso-soak-s3:/data \
-    --secret turso-soak-s3-key,type=env,target=RUSTFS_ACCESS_KEY \
-    --secret turso-soak-s3-secret,type=env,target=RUSTFS_SECRET_KEY \
-    --env RUSTFS_OVERRIDE_CPU_CORES=2 --env RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=32 \
-    --env RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=10 --env RUSTFS_RUNTIME_FSYNC_BLOCKING_THREADS=1 \
-    --env RUSTFS_SCANNER_ENABLED=false --env RUSTFS_HEAL_ENABLED=false \
-    --env RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS=10 --env RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS=1 \
-    --env RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=256 --env RUSTFS_CONSOLE_ENABLE=false \
-    docker.io/rustfs/rustfs:1.0.3-glibc
-target run --rm --pod "$pod" "${keys[@]}" --entrypoint sh docker.io/amazon/aws-cli:2.37.10 -c "
-    for _ in \$(seq 60); do
-        aws --endpoint-url \"\$AWS_ENDPOINT\" s3api head-bucket --bucket $bucket 2>/dev/null && exit
-        aws --endpoint-url \"\$AWS_ENDPOINT\" s3 mb s3://$bucket >/dev/null 2>&1 && exit
-        sleep 1
-    done
-    exit 1"
+run --name "$pod-s3" --memory 256m --volume turso-soak-garage:/var/lib/garage \
+    --secret turso-soak-garage-key,type=env,target=GARAGE_DEFAULT_ACCESS_KEY \
+    --secret turso-soak-garage-secret,type=env,target=GARAGE_DEFAULT_SECRET_KEY \
+    --secret turso-soak-garage-rpc,type=env,target=GARAGE_RPC_SECRET \
+    --env GARAGE_DEFAULT_BUCKET="$bucket" --env RUST_LOG=warn \
+    localhost/turso-soak-garage:latest /garage server --single-node --default-bucket
 
 run --name "$pod-server" --memory 512m --stop-timeout 30 --volume turso-soak-data:/data "${access[@]}" \
     --env RUST_LOG=warn,turso_sync_server=info,turso_sync_server::http=warn \
@@ -77,9 +70,9 @@ run --name "$pod-prometheus" --memory 256m --volume turso-soak-prometheus:/prome
     --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus \
     --storage.tsdb.retention.time=30d
 # Every client holds a copy of the database in memory per connection.
-run --name "$pod-client" --memory 512m "${access[@]}" --env SOAK_BACKUP_URL="$backup_url" \
+run --name "$pod-client" --memory 1g "${access[@]}" --env SOAK_BACKUP_URL="$backup_url" \
     localhost/turso-soak:latest
-run --name "$pod-client-go" --memory 512m "${access[@]}" --env SOAK_BACKUP_URL="$backup_url" \
+run --name "$pod-client-go" --memory 1g "${access[@]}" --env SOAK_BACKUP_URL="$backup_url" \
     localhost/turso-soak-go:latest
 
 target ps --pod --filter pod="$pod" --format '{{.Names}}\t{{.Status}}'
