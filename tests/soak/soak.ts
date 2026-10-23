@@ -204,9 +204,10 @@ async function values(db: Db): Promise<number[]> {
     return (await query(db, 'SELECT x FROM t ORDER BY x')).map((row: any) => row.x);
 }
 
+/** Only rows of our writers: other soak clients keep writing while a comparison holds ours still. */
 async function digest(db: Db): Promise<string> {
     const hash = createHash('sha256');
-    for (const row of await query(db, 'SELECT x, y FROM t ORDER BY x')) {
+    for (const row of await query(db, `SELECT x, y FROM t WHERE x < ${(WRITERS + 1) * ID_SPAN} ORDER BY x`)) {
         hash.update(`${row.x}:${row.y};`);
     }
     return hash.digest('hex');
